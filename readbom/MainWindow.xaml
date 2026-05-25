@@ -17,9 +17,13 @@
         <StackPanel Orientation="Horizontal">
             <Button Name="ConnectButton" Width="120" Height="34" Margin="0,0,8,0" Click="ConnectButton_OnClick">连接 SW</Button>
             <Button Name="ReadButton" Width="120" Height="34" Margin="0,0,8,0" Click="ReadButton_OnClick">读取属性/BOM</Button>
+            <Button Name="SaveToSwButton" Width="120" Height="34" Margin="0,0,8,0" Click="SaveToSwButton_OnClick">保存到 SW</Button>
             <Button Name="ExportCsvButton" Width="120" Height="34" Margin="0,0,8,0" Click="ExportCsvButton_OnClick">导出 CSV</Button>
             <Button Name="ExportExcelButton" Width="120" Height="34" Margin="0,0,8,0" Click="ExportExcelButton_OnClick">导出 Excel</Button>
             <Button Name="HeaderFilterButton" Width="110" Height="34" Margin="0,0,8,0" Click="HeaderFilterButton_OnClick">表头筛选</Button>
+            <Button Name="CopyColumnButton" Width="90" Height="34" Margin="0,0,8,0" Click="CopyColumnButton_OnClick">复制列</Button>
+            <Button Name="FillColumnButton" Width="90" Height="34" Margin="0,0,8,0" Click="FillColumnButton_OnClick">填充列</Button>
+            <Button Name="FindReplaceButton" Width="100" Height="34" Margin="0,0,8,0" Click="FindReplaceButton_OnClick">查找替换</Button>
             <Button Name="IncreaseRowHeightButton" Width="90" Height="34" Margin="0,0,8,0" Click="IncreaseRowHeightButton_OnClick">行高+</Button>
             <Button Name="DecreaseRowHeightButton" Width="90" Height="34" Margin="0,0,8,0" Click="DecreaseRowHeightButton_OnClick">行高-</Button>
             <TextBlock Name="StatusText" VerticalAlignment="Center" Foreground="DimGray"/>
@@ -49,7 +53,7 @@
             <ProgressBar Grid.Column="1" Name="ReadProgressBar" Height="16" Minimum="0" Maximum="100" Value="0"/>
         </Grid>
 
-        <DataGrid Grid.Row="2" Name="BomGrid" AutoGenerateColumns="False" IsReadOnly="True" CanUserAddRows="False" Margin="0" RowHeight="28" FontSize="12" Tag="20" PreviewMouseLeftButtonUp="BomGrid_OnPreviewMouseLeftButtonUp">
+        <DataGrid Grid.Row="2" Name="BomGrid" AutoGenerateColumns="False" IsReadOnly="False" CanUserAddRows="False" Margin="0" RowHeight="28" FontSize="12" Tag="20" SelectionMode="Extended" SelectionUnit="Cell" PreviewMouseLeftButtonUp="BomGrid_OnPreviewMouseLeftButtonUp" PreviewKeyDown="BomGrid_OnPreviewKeyDown">
             <DataGrid.CellStyle>
                 <Style TargetType="DataGridCell">
                     <Setter Property="VerticalContentAlignment" Value="Center"/>
