@@ -1,0 +1,36 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+    <PropertyGroup>
+        <OutputType>WinExe</OutputType>
+        <TargetFramework>net9.0-windows</TargetFramework>
+        <Nullable>enable</Nullable>
+        <ImplicitUsings>enable</ImplicitUsings>
+        <UseWPF>true</UseWPF>
+        <PlatformTarget>x64</PlatformTarget>
+        <Prefer32Bit>false</Prefer32Bit>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <None Include="property-mapping.txt">
+            <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+        </None>
+    </ItemGroup>
+
+    <ItemGroup>
+        <Resource Include="Assets\part.png" />
+        <Resource Include="Assets\assembly.png" />
+        <Resource Include="Assets\drawing.png" />
+    </ItemGroup>
+
+    <ItemGroup>
+        <Reference Include="Interop.SldWorks">
+            <HintPath>..\..\chajian2\lib\Interop.SldWorks.dll</HintPath>
+            <EmbedInteropTypes>True</EmbedInteropTypes>
+        </Reference>
+        <Reference Include="Interop.SwConst">
+            <HintPath>..\..\chajian2\lib\Interop.SwConst.dll</HintPath>
+            <EmbedInteropTypes>True</EmbedInteropTypes>
+        </Reference>
+    </ItemGroup>
+
+</Project>

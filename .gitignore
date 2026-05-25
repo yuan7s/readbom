@@ -1,0 +1,16 @@
+.vs/
+.idea/
+
+bin/
+obj/
+**/bin/
+**/obj/
+
+*.user
+*.suo
+*.cache
+*.log
+
+工程图.png
+装配体.png
+零件.png

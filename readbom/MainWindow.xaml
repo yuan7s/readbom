@@ -1,0 +1,179 @@
+<Window x:Class="readbom.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+        xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+        mc:Ignorable="d"
+        Title="SW 属性/BOM工具" Height="720" Width="1200" MinHeight="640" MinWidth="980">
+    <Grid Margin="12">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="120"/>
+        </Grid.RowDefinitions>
+
+        <StackPanel Orientation="Horizontal">
+            <Button Name="ConnectButton" Width="120" Height="34" Margin="0,0,8,0" Click="ConnectButton_OnClick">连接 SW</Button>
+            <Button Name="ReadButton" Width="120" Height="34" Margin="0,0,8,0" Click="ReadButton_OnClick">读取属性/BOM</Button>
+            <Button Name="ExportCsvButton" Width="120" Height="34" Margin="0,0,8,0" Click="ExportCsvButton_OnClick">导出 CSV</Button>
+            <Button Name="ExportExcelButton" Width="120" Height="34" Margin="0,0,8,0" Click="ExportExcelButton_OnClick">导出 Excel</Button>
+            <Button Name="HeaderFilterButton" Width="110" Height="34" Margin="0,0,8,0" Click="HeaderFilterButton_OnClick">表头筛选</Button>
+            <Button Name="IncreaseRowHeightButton" Width="90" Height="34" Margin="0,0,8,0" Click="IncreaseRowHeightButton_OnClick">行高+</Button>
+            <Button Name="DecreaseRowHeightButton" Width="90" Height="34" Margin="0,0,8,0" Click="DecreaseRowHeightButton_OnClick">行高-</Button>
+            <TextBlock Name="StatusText" VerticalAlignment="Center" Foreground="DimGray"/>
+        </StackPanel>
+
+        <StackPanel Grid.Row="1" Orientation="Horizontal" Margin="0,10,0,10">
+            <TextBlock VerticalAlignment="Center" Margin="0,0,8,0">读取方式</TextBlock>
+            <ComboBox Name="ReadModeComboBox" Width="170" Margin="0,0,20,0" SelectedIndex="0">
+                <ComboBoxItem>按BOM读取</ComboBoxItem>
+                <ComboBoxItem>全部读取</ComboBoxItem>
+            </ComboBox>
+            <TextBlock VerticalAlignment="Center" Margin="0,0,8,0">读取位置</TextBlock>
+            <ComboBox Name="PropertySourceComboBox" Width="180" Margin="0,0,20,0" SelectedIndex="1">
+                <ComboBoxItem>从自定义属性读取</ComboBoxItem>
+                <ComboBoxItem>从当前配置属性读取</ComboBoxItem>
+            </ComboBox>
+            <CheckBox Name="SkipVirtualCheckBox" IsChecked="True" Margin="0,0,20,0">不读取虚拟件</CheckBox>
+            <CheckBox Name="GroupByConfigCheckBox" IsChecked="True">按配置分组</CheckBox>
+        </StackPanel>
+
+        <Grid Grid.Row="3" Margin="0,10,0,0">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="220"/>
+                <ColumnDefinition Width="*"/>
+            </Grid.ColumnDefinitions>
+            <TextBlock Name="ProgressText" VerticalAlignment="Center" Foreground="DimGray">就绪</TextBlock>
+            <ProgressBar Grid.Column="1" Name="ReadProgressBar" Height="16" Minimum="0" Maximum="100" Value="0"/>
+        </Grid>
+
+        <DataGrid Grid.Row="2" Name="BomGrid" AutoGenerateColumns="False" IsReadOnly="True" CanUserAddRows="False" Margin="0" RowHeight="28" FontSize="12" Tag="20" PreviewMouseLeftButtonUp="BomGrid_OnPreviewMouseLeftButtonUp">
+            <DataGrid.CellStyle>
+                <Style TargetType="DataGridCell">
+                    <Setter Property="VerticalContentAlignment" Value="Center"/>
+                    <Setter Property="Padding" Value="4,0"/>
+                    <Setter Property="Template">
+                        <Setter.Value>
+                            <ControlTemplate TargetType="DataGridCell">
+                                <Border Background="{TemplateBinding Background}"
+                                        BorderBrush="{TemplateBinding BorderBrush}"
+                                        BorderThickness="{TemplateBinding BorderThickness}"
+                                        SnapsToDevicePixels="True">
+                                    <ContentPresenter VerticalAlignment="Center"
+                                                      HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}"
+                                                      SnapsToDevicePixels="{TemplateBinding SnapsToDevicePixels}"/>
+                                </Border>
+                            </ControlTemplate>
+                        </Setter.Value>
+                    </Setter>
+                </Style>
+            </DataGrid.CellStyle>
+            <DataGrid.ColumnHeaderStyle>
+                <Style TargetType="DataGridColumnHeader">
+                    <Setter Property="MinHeight" Value="36"/>
+                    <Setter Property="FontSize" Value="14"/>
+                    <Setter Property="FontWeight" Value="SemiBold"/>
+                    <Setter Property="Padding" Value="8,0"/>
+                    <Setter Property="VerticalContentAlignment" Value="Center"/>
+                    <Setter Property="HorizontalContentAlignment" Value="Center"/>
+                </Style>
+            </DataGrid.ColumnHeaderStyle>
+            <DataGrid.Columns>
+                <DataGridTemplateColumn Header="类型" Width="56">
+                    <DataGridTemplateColumn.CellStyle>
+                        <Style TargetType="DataGridCell" BasedOn="{StaticResource {x:Type DataGridCell}}">
+                            <Setter Property="HorizontalContentAlignment" Value="Center"/>
+                        </Style>
+                    </DataGridTemplateColumn.CellStyle>
+                    <DataGridTemplateColumn.CellTemplate>
+                        <DataTemplate>
+                            <Image Source="{Binding DocumentIconPath}"
+                                   ToolTip="{Binding DocumentType}"
+                                   HorizontalAlignment="Center"
+                                   VerticalAlignment="Center"
+                                   Width="{Binding Tag, RelativeSource={RelativeSource AncestorType=DataGrid}}"
+                                   Height="{Binding Tag, RelativeSource={RelativeSource AncestorType=DataGrid}}"
+                                   Stretch="Uniform"
+                                   SnapsToDevicePixels="True"/>
+                        </DataTemplate>
+                    </DataGridTemplateColumn.CellTemplate>
+                </DataGridTemplateColumn>
+                <DataGridTemplateColumn Header="工程图" Width="64">
+                    <DataGridTemplateColumn.CellStyle>
+                        <Style TargetType="DataGridCell" BasedOn="{StaticResource {x:Type DataGridCell}}">
+                            <Setter Property="HorizontalContentAlignment" Value="Center"/>
+                        </Style>
+                    </DataGridTemplateColumn.CellStyle>
+                    <DataGridTemplateColumn.CellTemplate>
+                        <DataTemplate>
+                            <Image Source="{Binding DrawingIconPath}"
+                                   ToolTip="{Binding DrawingStatus}"
+                                   HorizontalAlignment="Center"
+                                   VerticalAlignment="Center"
+                                   Width="{Binding Tag, RelativeSource={RelativeSource AncestorType=DataGrid}}"
+                                   Height="{Binding Tag, RelativeSource={RelativeSource AncestorType=DataGrid}}"
+                                   Stretch="Uniform"
+                                   SnapsToDevicePixels="True"/>
+                        </DataTemplate>
+                    </DataGridTemplateColumn.CellTemplate>
+                </DataGridTemplateColumn>
+                <DataGridTextColumn Header="序号" Binding="{Binding Index}" Width="48">
+                    <DataGridTextColumn.CellStyle>
+                        <Style TargetType="DataGridCell" BasedOn="{StaticResource {x:Type DataGridCell}}">
+                            <Setter Property="HorizontalContentAlignment" Value="Center"/>
+                        </Style>
+                    </DataGridTextColumn.CellStyle>
+                    <DataGridTextColumn.ElementStyle>
+                        <Style TargetType="TextBlock">
+                            <Setter Property="HorizontalAlignment" Value="Stretch"/>
+                            <Setter Property="VerticalAlignment" Value="Center"/>
+                            <Setter Property="TextAlignment" Value="Center"/>
+                        </Style>
+                    </DataGridTextColumn.ElementStyle>
+                </DataGridTextColumn>
+                <DataGridTextColumn Header="文件名" Binding="{Binding FileName}" Width="220"/>
+                <DataGridTextColumn Header="配置" Binding="{Binding Configuration}" Width="90"/>
+                <DataGridTextColumn Header="数量" Binding="{Binding Quantity}" Width="56">
+                    <DataGridTextColumn.CellStyle>
+                        <Style TargetType="DataGridCell" BasedOn="{StaticResource {x:Type DataGridCell}}">
+                            <Setter Property="HorizontalContentAlignment" Value="Center"/>
+                        </Style>
+                    </DataGridTextColumn.CellStyle>
+                    <DataGridTextColumn.ElementStyle>
+                        <Style TargetType="TextBlock">
+                            <Setter Property="HorizontalAlignment" Value="Stretch"/>
+                            <Setter Property="VerticalAlignment" Value="Center"/>
+                            <Setter Property="TextAlignment" Value="Center"/>
+                        </Style>
+                    </DataGridTextColumn.ElementStyle>
+                </DataGridTextColumn>
+                <DataGridTextColumn Header="SW材料" Binding="{Binding Material}" Width="140">
+                    <DataGridTextColumn.CellStyle>
+                        <Style TargetType="DataGridCell" BasedOn="{StaticResource {x:Type DataGridCell}}">
+                            <Style.Triggers>
+                                <DataTrigger Binding="{Binding HasUnsetMaterial}" Value="True">
+                                    <Setter Property="Background" Value="#FFFFD6D6"/>
+                                </DataTrigger>
+                            </Style.Triggers>
+                        </Style>
+                    </DataGridTextColumn.CellStyle>
+                </DataGridTextColumn>
+                <DataGridTextColumn Header="完整路径" Binding="{Binding FullPath}" Width="300">
+                    <DataGridTextColumn.CellStyle>
+                        <Style TargetType="DataGridCell" BasedOn="{StaticResource {x:Type DataGridCell}}">
+                            <Style.Triggers>
+                                <DataTrigger Binding="{Binding IsOutsideMainAssemblyDirectory}" Value="True">
+                                    <Setter Property="Background" Value="#FFFFD6D6"/>
+                                </DataTrigger>
+                            </Style.Triggers>
+                        </Style>
+                    </DataGridTextColumn.CellStyle>
+                </DataGridTextColumn>
+            </DataGrid.Columns>
+        </DataGrid>
+
+        <RichTextBox Grid.Row="4" Name="LogTextBox" Margin="0,10,0,0" VerticalScrollBarVisibility="Auto" IsReadOnly="True"/>
+    </Grid>
+</Window>
