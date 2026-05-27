@@ -4,7 +4,34 @@
         xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
         xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
         mc:Ignorable="d"
-        Title="SW 属性/BOM工具" Height="720" Width="1200" MinHeight="640" MinWidth="980">
+        Title="SW 属性/BOM工具" Height="720" Width="1200" MinHeight="640" MinWidth="980" WindowState="Maximized">
+    <Window.Resources>
+        <Style x:Key="ToolbarButtonStyle" TargetType="Button">
+            <Setter Property="Height" Value="32"/>
+            <Setter Property="MinWidth" Value="88"/>
+            <Setter Property="Padding" Value="12,0"/>
+            <Setter Property="Margin" Value="0,0,8,8"/>
+            <Setter Property="VerticalContentAlignment" Value="Center"/>
+        </Style>
+        <Style x:Key="ToolbarWideButtonStyle" TargetType="Button" BasedOn="{StaticResource ToolbarButtonStyle}">
+            <Setter Property="MinWidth" Value="112"/>
+        </Style>
+        <Style x:Key="ToolbarOptionTextStyle" TargetType="TextBlock">
+            <Setter Property="VerticalAlignment" Value="Center"/>
+            <Setter Property="Margin" Value="0,0,8,8"/>
+        </Style>
+        <Style x:Key="ToolbarGroupTitleStyle" TargetType="TextBlock">
+            <Setter Property="Foreground" Value="DimGray"/>
+            <Setter Property="FontSize" Value="12"/>
+            <Setter Property="Margin" Value="0,0,0,6"/>
+        </Style>
+        <Style x:Key="ToolbarGroupBorderStyle" TargetType="Border">
+            <Setter Property="BorderBrush" Value="#D8D8D8"/>
+            <Setter Property="BorderThickness" Value="0,0,1,0"/>
+            <Setter Property="Padding" Value="0,0,10,0"/>
+            <Setter Property="Margin" Value="0,0,10,0"/>
+        </Style>
+    </Window.Resources>
     <Grid Margin="12">
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto"/>
@@ -14,35 +41,81 @@
             <RowDefinition Height="120"/>
         </Grid.RowDefinitions>
 
-        <StackPanel Orientation="Horizontal">
-            <Button Name="ConnectButton" Width="120" Height="34" Margin="0,0,8,0" Click="ConnectButton_OnClick">连接 SW</Button>
-            <Button Name="ReadButton" Width="120" Height="34" Margin="0,0,8,0" Click="ReadButton_OnClick">读取属性/BOM</Button>
-            <Button Name="SaveToSwButton" Width="120" Height="34" Margin="0,0,8,0" Click="SaveToSwButton_OnClick">保存到 SW</Button>
-            <Button Name="ExportCsvButton" Width="120" Height="34" Margin="0,0,8,0" Click="ExportCsvButton_OnClick">导出 CSV</Button>
-            <Button Name="ExportExcelButton" Width="120" Height="34" Margin="0,0,8,0" Click="ExportExcelButton_OnClick">导出 Excel</Button>
-            <Button Name="HeaderFilterButton" Width="110" Height="34" Margin="0,0,8,0" Click="HeaderFilterButton_OnClick">表头筛选</Button>
-            <Button Name="CopyColumnButton" Width="90" Height="34" Margin="0,0,8,0" Click="CopyColumnButton_OnClick">复制列</Button>
-            <Button Name="FillColumnButton" Width="90" Height="34" Margin="0,0,8,0" Click="FillColumnButton_OnClick">填充列</Button>
-            <Button Name="FindReplaceButton" Width="100" Height="34" Margin="0,0,8,0" Click="FindReplaceButton_OnClick">查找替换</Button>
-            <Button Name="IncreaseRowHeightButton" Width="90" Height="34" Margin="0,0,8,0" Click="IncreaseRowHeightButton_OnClick">行高+</Button>
-            <Button Name="DecreaseRowHeightButton" Width="90" Height="34" Margin="0,0,8,0" Click="DecreaseRowHeightButton_OnClick">行高-</Button>
-            <TextBlock Name="StatusText" VerticalAlignment="Center" Foreground="DimGray"/>
-        </StackPanel>
+        <Border BorderBrush="#D8D8D8" BorderThickness="0,0,0,1" Padding="0,0,0,4">
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="220"/>
+                </Grid.ColumnDefinitions>
+                <Border Style="{StaticResource ToolbarGroupBorderStyle}">
+                    <StackPanel>
+                        <TextBlock Style="{StaticResource ToolbarGroupTitleStyle}">连接读取</TextBlock>
+                        <WrapPanel>
+                            <Button Name="ConnectButton" Style="{StaticResource ToolbarWideButtonStyle}" Click="ConnectButton_OnClick">连接 SW</Button>
+                            <Button Name="ReadButton" Style="{StaticResource ToolbarWideButtonStyle}" Click="ReadButton_OnClick">读取属性/BOM</Button>
+                        </WrapPanel>
+                    </StackPanel>
+                </Border>
+                <Border Grid.Column="1" Style="{StaticResource ToolbarGroupBorderStyle}">
+                    <StackPanel>
+                        <TextBlock Style="{StaticResource ToolbarGroupTitleStyle}">写入处理</TextBlock>
+                        <WrapPanel>
+                            <Button Name="SaveToSwButton" Style="{StaticResource ToolbarWideButtonStyle}" Click="SaveToSwButton_OnClick">保存到 SW</Button>
+                            <Button Name="RelocateFilesButton" Style="{StaticResource ToolbarWideButtonStyle}" Click="RelocateFilesButton_OnClick">复制重装</Button>
+                        </WrapPanel>
+                    </StackPanel>
+                </Border>
+                <Border Grid.Column="2" Style="{StaticResource ToolbarGroupBorderStyle}">
+                    <StackPanel>
+                        <TextBlock Style="{StaticResource ToolbarGroupTitleStyle}">表格操作</TextBlock>
+                        <WrapPanel>
+                            <Button Name="HeaderFilterButton" Style="{StaticResource ToolbarButtonStyle}" Click="HeaderFilterButton_OnClick">表头筛选</Button>
+                            <Button Name="CopyColumnButton" Style="{StaticResource ToolbarButtonStyle}" Click="CopyColumnButton_OnClick">复制列</Button>
+                            <Button Name="FillColumnButton" Style="{StaticResource ToolbarButtonStyle}" Click="FillColumnButton_OnClick">填充列</Button>
+                            <Button Name="CalculateBlankSizeButton" Style="{StaticResource ToolbarWideButtonStyle}" Click="CalculateBlankSizeButton_OnClick">计算下料</Button>
+                            <Button Name="FindReplaceButton" Style="{StaticResource ToolbarWideButtonStyle}" Click="FindReplaceButton_OnClick">查找替换</Button>
+                        </WrapPanel>
+                    </StackPanel>
+                </Border>
+                <Border Grid.Column="3" Style="{StaticResource ToolbarGroupBorderStyle}">
+                    <StackPanel>
+                        <TextBlock Style="{StaticResource ToolbarGroupTitleStyle}">显示导出</TextBlock>
+                        <WrapPanel>
+                            <Button Name="IncreaseRowHeightButton" Style="{StaticResource ToolbarButtonStyle}" Click="IncreaseRowHeightButton_OnClick">行高+</Button>
+                            <Button Name="DecreaseRowHeightButton" Style="{StaticResource ToolbarButtonStyle}" Click="DecreaseRowHeightButton_OnClick">行高-</Button>
+                            <Button Name="ThumbnailButton" Style="{StaticResource ToolbarButtonStyle}" Click="ThumbnailButton_OnClick">缩略图关</Button>
+                            <Button Name="ExportCsvButton" Style="{StaticResource ToolbarButtonStyle}" Click="ExportCsvButton_OnClick">导出 CSV</Button>
+                            <Button Name="ExportExcelButton" Style="{StaticResource ToolbarWideButtonStyle}" Click="ExportExcelButton_OnClick">导出 Excel</Button>
+                        </WrapPanel>
+                    </StackPanel>
+                </Border>
+                <TextBlock Grid.Column="5"
+                           Name="StatusText"
+                           Margin="12,0,0,8"
+                           VerticalAlignment="Center"
+                           Foreground="DimGray"
+                           TextWrapping="Wrap"/>
+            </Grid>
+        </Border>
 
-        <StackPanel Grid.Row="1" Orientation="Horizontal" Margin="0,10,0,10">
-            <TextBlock VerticalAlignment="Center" Margin="0,0,8,0">读取方式</TextBlock>
-            <ComboBox Name="ReadModeComboBox" Width="170" Margin="0,0,20,0" SelectedIndex="0">
+        <WrapPanel Grid.Row="1" Margin="0,10,0,10">
+            <TextBlock Style="{StaticResource ToolbarOptionTextStyle}">读取方式</TextBlock>
+            <ComboBox Name="ReadModeComboBox" Width="170" Height="30" Margin="0,0,20,8" SelectedIndex="0">
                 <ComboBoxItem>按BOM读取</ComboBoxItem>
                 <ComboBoxItem>全部读取</ComboBoxItem>
             </ComboBox>
-            <TextBlock VerticalAlignment="Center" Margin="0,0,8,0">读取位置</TextBlock>
-            <ComboBox Name="PropertySourceComboBox" Width="180" Margin="0,0,20,0" SelectedIndex="1">
+            <TextBlock Style="{StaticResource ToolbarOptionTextStyle}">读取位置</TextBlock>
+            <ComboBox Name="PropertySourceComboBox" Width="180" Height="30" Margin="0,0,20,8" SelectedIndex="1">
                 <ComboBoxItem>从自定义属性读取</ComboBoxItem>
                 <ComboBoxItem>从当前配置属性读取</ComboBoxItem>
             </ComboBox>
-            <CheckBox Name="SkipVirtualCheckBox" IsChecked="True" Margin="0,0,20,0">不读取虚拟件</CheckBox>
-            <CheckBox Name="GroupByConfigCheckBox" IsChecked="True">按配置分组</CheckBox>
-        </StackPanel>
+            <CheckBox Name="SkipVirtualCheckBox" IsChecked="True" Margin="0,0,20,8" VerticalAlignment="Center">不读取虚拟件</CheckBox>
+            <CheckBox Name="GroupByConfigCheckBox" IsChecked="True" Margin="0,0,20,8" VerticalAlignment="Center">按配置分组</CheckBox>
+        </WrapPanel>
 
         <Grid Grid.Row="3" Margin="0,10,0,0">
             <Grid.ColumnDefinitions>
@@ -53,7 +126,52 @@
             <ProgressBar Grid.Column="1" Name="ReadProgressBar" Height="16" Minimum="0" Maximum="100" Value="0"/>
         </Grid>
 
-        <DataGrid Grid.Row="2" Name="BomGrid" AutoGenerateColumns="False" IsReadOnly="False" CanUserAddRows="False" Margin="0" RowHeight="28" FontSize="12" Tag="20" SelectionMode="Extended" SelectionUnit="Cell" PreviewMouseLeftButtonUp="BomGrid_OnPreviewMouseLeftButtonUp" PreviewKeyDown="BomGrid_OnPreviewKeyDown">
+        <DataGrid Grid.Row="2"
+                  Name="BomGrid"
+                  AutoGenerateColumns="False"
+                  IsReadOnly="False"
+                  CanUserAddRows="False"
+                  Margin="0"
+                  RowHeight="28"
+                  FontSize="12"
+                  Tag="20"
+                  SelectionMode="Extended"
+                  SelectionUnit="Cell"
+                  ClipboardCopyMode="None"
+                  FrozenColumnCount="3"
+                  GridLinesVisibility="All"
+                  HeadersVisibility="All"
+                  EnableRowVirtualization="True"
+                  EnableColumnVirtualization="True"
+                  VirtualizingPanel.IsVirtualizing="True"
+                  VirtualizingPanel.VirtualizationMode="Recycling"
+                  VirtualizingPanel.ScrollUnit="Pixel"
+                  VirtualizingPanel.CacheLength="1"
+                  VirtualizingPanel.CacheLengthUnit="Page"
+                  ScrollViewer.CanContentScroll="True"
+                  ScrollViewer.IsDeferredScrollingEnabled="True"
+                  CanUserResizeRows="False"
+                  CanUserReorderColumns="True"
+                  CanUserSortColumns="True"
+                  PreviewMouseLeftButtonUp="BomGrid_OnPreviewMouseLeftButtonUp"
+                  PreviewMouseRightButtonDown="BomGrid_OnPreviewMouseRightButtonDown"
+                  PreviewKeyDown="BomGrid_OnPreviewKeyDown"
+                  PreviewTextInput="BomGrid_OnPreviewTextInput"
+                  CellEditEnding="BomGrid_OnCellEditEnding"
+                  SelectedCellsChanged="BomGrid_OnSelectedCellsChanged"
+                  CurrentCellChanged="BomGrid_OnCurrentCellChanged">
+            <DataGrid.ContextMenu>
+                <ContextMenu>
+                    <MenuItem Header="复制" Click="CopyCellsMenuItem_OnClick"/>
+                    <MenuItem Header="粘贴" Click="PasteCellsMenuItem_OnClick"/>
+                    <Separator/>
+                    <MenuItem Header="复制列" Click="CopyColumnButton_OnClick"/>
+                    <MenuItem Header="填充列" Click="FillColumnButton_OnClick"/>
+                    <MenuItem Header="查找替换" Click="FindReplaceButton_OnClick"/>
+                    <Separator/>
+                    <MenuItem Header="保存到 SW" Click="SaveToSwButton_OnClick"/>
+                </ContextMenu>
+            </DataGrid.ContextMenu>
             <DataGrid.CellStyle>
                 <Style TargetType="DataGridCell">
                     <Setter Property="VerticalContentAlignment" Value="Center"/>
@@ -164,7 +282,7 @@
                         </Style>
                     </DataGridTextColumn.CellStyle>
                 </DataGridTextColumn>
-                <DataGridTextColumn Header="完整路径" Binding="{Binding FullPath}" Width="300">
+                <DataGridTextColumn Header="完整路径" Binding="{Binding DirectoryPath}" Width="300">
                     <DataGridTextColumn.CellStyle>
                         <Style TargetType="DataGridCell" BasedOn="{StaticResource {x:Type DataGridCell}}">
                             <Style.Triggers>

@@ -9,15 +9,20 @@ using System.Linq;
 using System.Runtime.InteropServices;
 using System.Runtime.InteropServices.ComTypes;
 using System.Reflection;
+using System.Net.Http;
 using System.Text;
+using System.Text.Json;
+using System.Text.Json.Serialization;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Controls.Primitives;
 using System.Windows.Data;
+using System.Windows.Interop;
 using System.Windows.Input;
 using System.Windows.Media;
+using System.Windows.Media.Imaging;
 using Microsoft.Win32;
 using System.Collections;
 using WpfParagraph = System.Windows.Documents.Paragraph;
@@ -33,7 +38,12 @@ public partial class MainWindow : Window
     private ICollectionView? _view;
     private readonly PropertyMappingConfig _propertyMapping;
     private readonly Dictionary<string, string> _headerFilters = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, HashSet<string>> _headerValueFilters = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<DataGridColumn, string> _dynamicPropertyColumns = new();
+    private readonly Dictionary<DataGridColumn, object> _columnOriginalHeaders = new();
+    private ThumbnailPreviewWindow? _thumbnailWindow;
+    private BomRow? _thumbnailRow;
+    private bool _thumbnailEnabled = true;
     private bool _headerFilterEnabled;
     private int _gridSizeLevel;
 
@@ -60,9 +70,10 @@ public partial class MainWindow : Window
         }
         ConfigurePropertyColumns();
         SetStatus("未连接 SolidWorks");
+        Loaded += (_, _) => EnsureThumbnailWindowVisible();
     }
 
-    private void ConnectButton_OnClick(object sender, RoutedEventArgs e)
+    private async void ConnectButton_OnClick(object sender, RoutedEventArgs e)
     {
         try
         {
@@ -72,9 +83,9 @@ public partial class MainWindow : Window
             var info = SolidWorksReader.CheckConnection(_swApp);
             _connectedSwPid = info.ProcessId;
             SetStatus("已连接 SolidWorks");
-            AppendLog($"连接成功。PID: {info.ProcessId}，SW版本: {info.DisplayVersion}，内部版本: {info.Version}，已打开文档: {info.OpenDocumentCount}");
-            AppendLog($"SW窗口标题: {(string.IsNullOrWhiteSpace(info.MainWindowTitle) ? "(无)" : info.MainWindowTitle)}");
+            AppendLog("连接成功");
             AppendDocumentTitleLog(info.ActiveDocumentTitle);
+            await AppendAddinConnectionStatusAsync();
         }
         catch (Exception ex)
         {
@@ -90,10 +101,9 @@ public partial class MainWindow : Window
 
     private async void ReadButton_OnClick(object sender, RoutedEventArgs e)
     {
+        var totalWatch = Stopwatch.StartNew();
         try
         {
-            _swApp ??= SolidWorksReader.Connect();
-            var swApp = _swApp;
             var options = new ReadOptions(
                 GetReadMode(),
                 GetPropertySourceMode(),
@@ -105,7 +115,25 @@ public partial class MainWindow : Window
             ReadButton.IsEnabled = false;
             AppendLog("开始读取属性/BOM");
             Action<ReadProgress> progress = ReportReadProgress;
-            var result = await Task.Run(() => SolidWorksReader.ReadBom(swApp, options, _propertyMapping, progress));
+            List<BomRow> result;
+            if (await SolidWorksAddinClient.IsAvailableAsync())
+            {
+                AppendLog("使用 SW Add-in HTTP 通道读取 BOM");
+                var addinWatch = Stopwatch.StartNew();
+                result = await SolidWorksAddinClient.ReadBomAsync(_propertyMapping.PropertyNames, options, progress, message => AppendLog(message));
+                AppendLog($"读取计时: Add-in返回并转换完成 {addinWatch.ElapsedMilliseconds}ms");
+            }
+            else
+            {
+                AppendLog("SW Add-in HTTP 通道不可用，回退 COM 读取");
+                _swApp ??= SolidWorksReader.Connect();
+                var swApp = _swApp;
+                var comWatch = Stopwatch.StartNew();
+                result = await Task.Run(() => SolidWorksReader.ReadBom(swApp, options, _propertyMapping, progress));
+                AppendLog($"读取计时: COM读取完成 {comWatch.ElapsedMilliseconds}ms");
+            }
+
+            var bindWatch = Stopwatch.StartNew();
             _rows.Clear();
             var index = 1;
             foreach (var item in result)
@@ -113,11 +141,13 @@ public partial class MainWindow : Window
                 item.Index = index++;
                 _rows.Add(item);
             }
-            ValidateBomPaths();
+            AppendLog($"读取计时: 表格绑定 {_rows.Count} 行 {bindWatch.ElapsedMilliseconds}ms");
 
             SetStatus($"读取完成: {_rows.Count} 项");
             AppendLog($"读取完成，项目数: {_rows.Count}");
+            var summaryWatch = Stopwatch.StartNew();
             AppendPropertyReadSummary();
+            AppendLog($"读取计时: 属性统计 {summaryWatch.ElapsedMilliseconds}ms，总计 {totalWatch.ElapsedMilliseconds}ms");
             FinishReadProgress(_rows.Count);
         }
         catch (Exception ex)
@@ -177,6 +207,61 @@ public partial class MainWindow : Window
         finally
         {
             SaveToSwButton.IsEnabled = true;
+            ReadButton.IsEnabled = true;
+        }
+    }
+
+    private async void RelocateFilesButton_OnClick(object sender, RoutedEventArgs e)
+    {
+        try
+        {
+            var targetRows = _rows.Skip(1).Where(x => x.IsOutsideMainAssemblyDirectory).ToList();
+            if (targetRows.Count == 0)
+            {
+                MessageBox.Show(this, "没有检测到不在主装配体目录下的文件。", "提示", MessageBoxButton.OK, MessageBoxImage.Information);
+                return;
+            }
+
+            var confirm = MessageBox.Show(
+                this,
+                $"将复制 {targetRows.Count} 个文件到主装配体目录，并重装对应组件引用。是否继续？",
+                "复制重装",
+                MessageBoxButton.YesNo,
+                MessageBoxImage.Question);
+            if (confirm != MessageBoxResult.Yes)
+            {
+                return;
+            }
+
+            _swApp ??= SolidWorksReader.Connect();
+            var swApp = _swApp;
+            var rows = targetRows.ToList();
+            Action<ReadProgress> progress = ReportReadProgress;
+
+            RelocateFilesButton.IsEnabled = false;
+            ReadButton.IsEnabled = false;
+            ResetSaveProgress();
+            ProgressText.Text = "正在复制重装...";
+            AppendLog("开始复制不在主装配体目录下的文件并重装引用");
+
+            var result = await Task.Run(() => SolidWorksReader.CopyExternalFilesToMainAssemblyDirectory(swApp, _rows[0], rows, progress));
+
+            ValidateBomPaths();
+            SetStatus($"复制重装完成: {result.ReloadedRows}/{result.TotalRows} 项");
+            AppendLog($"复制重装完成: 复制 {result.CopiedFiles} 个，重装 {result.ReloadedRows}/{result.TotalRows} 项，失败 {result.FailedRows} 项");
+            FinishSaveProgress(result.ReloadedRows, result.TotalRows);
+        }
+        catch (Exception ex)
+        {
+            SetStatus("复制重装失败");
+            AppendLog($"复制重装失败: {ex.Message}", Brushes.Red);
+            ProgressText.Text = "复制重装失败";
+            ReadProgressBar.IsIndeterminate = false;
+            MessageBox.Show(this, ex.Message, "复制重装失败", MessageBoxButton.OK, MessageBoxImage.Error);
+        }
+        finally
+        {
+            RelocateFilesButton.IsEnabled = true;
             ReadButton.IsEnabled = true;
         }
     }
@@ -312,6 +397,67 @@ public partial class MainWindow : Window
         ApplyGridRowSize();
     }
 
+    private void ThumbnailButton_OnClick(object sender, RoutedEventArgs e)
+    {
+        _thumbnailEnabled = !_thumbnailEnabled;
+        ThumbnailButton.Content = _thumbnailEnabled ? "缩略图关" : "缩略图开";
+
+        if (!_thumbnailEnabled)
+        {
+            _thumbnailWindow?.Hide();
+            return;
+        }
+
+        EnsureThumbnailWindowVisible();
+    }
+
+    private void EnsureThumbnailWindowVisible()
+    {
+        if (!_thumbnailEnabled)
+        {
+            return;
+        }
+
+        if (_thumbnailWindow is null)
+        {
+            _thumbnailWindow = new ThumbnailPreviewWindow();
+            _thumbnailWindow.Closed += (_, _) =>
+            {
+                _thumbnailWindow = null;
+                _thumbnailEnabled = false;
+                ThumbnailButton.Content = "缩略图开";
+            };
+        }
+
+        PositionThumbnailWindow();
+        _thumbnailWindow.Show();
+        _thumbnailWindow.WindowState = WindowState.Normal;
+        _thumbnailWindow.ShowInTaskbar = true;
+        _thumbnailWindow.Activate();
+        _thumbnailWindow.Focus();
+        UpdateThumbnailWindow();
+    }
+
+    private void PositionThumbnailWindow()
+    {
+        if (_thumbnailWindow is null)
+        {
+            return;
+        }
+
+        var targetLeft = Left + ActualWidth - _thumbnailWindow.Width - 24;
+        var targetTop = Top + 96;
+        if (WindowState == WindowState.Maximized)
+        {
+            var workArea = SystemParameters.WorkArea;
+            targetLeft = workArea.Right - _thumbnailWindow.Width - 24;
+            targetTop = workArea.Top + 96;
+        }
+
+        _thumbnailWindow.Left = Math.Max(SystemParameters.WorkArea.Left, targetLeft);
+        _thumbnailWindow.Top = Math.Max(SystemParameters.WorkArea.Top, targetTop);
+    }
+
     private void ApplyGridRowSize()
     {
         BomGrid.RowHeight = 28 + _gridSizeLevel * 6;
@@ -329,10 +475,12 @@ public partial class MainWindow : Window
         if (!_headerFilterEnabled)
         {
             _headerFilters.Clear();
+            _headerValueFilters.Clear();
             ApplyHeaderFilters();
         }
 
-        SetStatus(_headerFilterEnabled ? "已开启表头筛选，点击列标题设置条件" : $"读取完成: {_rows.Count} 项");
+        UpdateHeaderFilterButtons();
+        SetStatus(_headerFilterEnabled ? "已开启表头筛选，点击表头筛选按钮设置条件" : $"读取完成: {_rows.Count} 项");
     }
 
     private void CopyColumnButton_OnClick(object sender, RoutedEventArgs e)
@@ -364,9 +512,65 @@ public partial class MainWindow : Window
             row.SetProperty(result.Target.PropertyName, result.Value);
         }
 
-        BomGrid.Items.Refresh();
+        RefreshBomGridSafely();
         AppendLog($"填充列: {result.Target.DisplayName}，{rows.Count} 行");
         SetStatus($"已填充列: {result.Target.DisplayName}");
+    }
+
+    private async void CalculateBlankSizeButton_OnClick(object sender, RoutedEventArgs e)
+    {
+        try
+        {
+            if (_rows.Count == 0)
+            {
+                MessageBox.Show(this, "没有可计算的数据，请先读取 BOM。", "提示", MessageBoxButton.OK, MessageBoxImage.Information);
+                return;
+            }
+
+            var target = ShowBlankSizeColumnDialog();
+            if (target is null || string.IsNullOrWhiteSpace(target.PropertyName))
+            {
+                return;
+            }
+
+            var targetRows = GetVisibleRows()
+                .Where(row => string.IsNullOrWhiteSpace(row.GetProperty(target.PropertyName)))
+                .ToList();
+            if (targetRows.Count == 0)
+            {
+                MessageBox.Show(this, $"当前筛选范围内没有 [{target.DisplayName}] 为空的项目。", "提示", MessageBoxButton.OK, MessageBoxImage.Information);
+                return;
+            }
+
+            _swApp ??= SolidWorksReader.Connect();
+            var swApp = _swApp;
+            Action<ReadProgress> progress = ReportReadProgress;
+
+            CalculateBlankSizeButton.IsEnabled = false;
+            ReadButton.IsEnabled = false;
+            ResetSaveProgress();
+            AppendLog($"开始计算下料尺寸: 目标列 [{target.DisplayName}]，空值 {targetRows.Count} 项");
+
+            var result = await Task.Run(() => SolidWorksReader.CalculateBlankSizes(swApp, targetRows, target.PropertyName, progress));
+
+            RefreshBomGridSafely();
+            SetStatus($"下料尺寸计算完成: {result.UpdatedRows}/{result.TotalRows} 项");
+            AppendLog($"下料尺寸计算完成: 成功 {result.UpdatedRows}/{result.TotalRows}，失败 {result.FailedRows} 项");
+            FinishSaveProgress(result.UpdatedRows, result.TotalRows);
+        }
+        catch (Exception ex)
+        {
+            SetStatus("下料尺寸计算失败");
+            AppendLog($"下料尺寸计算失败: {ex.Message}", Brushes.Red);
+            ProgressText.Text = "下料尺寸计算失败";
+            ReadProgressBar.IsIndeterminate = false;
+            MessageBox.Show(this, ex.Message, "下料尺寸计算失败", MessageBoxButton.OK, MessageBoxImage.Error);
+        }
+        finally
+        {
+            CalculateBlankSizeButton.IsEnabled = true;
+            ReadButton.IsEnabled = true;
+        }
     }
 
     private void FindReplaceButton_OnClick(object sender, RoutedEventArgs e)
@@ -397,7 +601,7 @@ public partial class MainWindow : Window
             }
         }
 
-        BomGrid.Items.Refresh();
+        RefreshBomGridSafely();
         AppendLog($"查找替换: {changed} 个单元格，查找 [{result.FindText}]");
         SetStatus($"查找替换完成: {changed} 个单元格");
     }
@@ -425,10 +629,60 @@ public partial class MainWindow : Window
         e.Handled = true;
     }
 
+    private void HeaderFilterGlyph_OnClick(object sender, RoutedEventArgs e)
+    {
+        if (sender is not Button { Tag: DataGridColumn column })
+        {
+            return;
+        }
+
+        var header = FindColumnHeader(column);
+        if (header is null)
+        {
+            return;
+        }
+
+        var propertyName = GetColumnPropertyName(column);
+        if (string.IsNullOrWhiteSpace(propertyName))
+        {
+            return;
+        }
+
+        OpenHeaderFilterMenu(header, propertyName);
+        e.Handled = true;
+    }
+
     private void BomGrid_OnPreviewKeyDown(object sender, KeyEventArgs e)
     {
+        if (e.Key == Key.F2 || e.Key == Key.Enter)
+        {
+            if (BeginCurrentDynamicCellEdit(e))
+            {
+                e.Handled = true;
+            }
+
+            return;
+        }
+
+        if (e.Key == Key.Delete)
+        {
+            if (ClearSelectedDynamicCells())
+            {
+                e.Handled = true;
+            }
+
+            return;
+        }
+
         if ((Keyboard.Modifiers & ModifierKeys.Control) != ModifierKeys.Control)
         {
+            return;
+        }
+
+        if (e.Key == Key.A)
+        {
+            BomGrid.SelectAllCells();
+            e.Handled = true;
             return;
         }
 
@@ -449,6 +703,90 @@ public partial class MainWindow : Window
                 e.Handled = true;
             }
         }
+    }
+
+    private void BomGrid_OnPreviewTextInput(object sender, TextCompositionEventArgs e)
+    {
+        if (string.IsNullOrEmpty(e.Text) || Keyboard.Modifiers != ModifierKeys.None)
+        {
+            return;
+        }
+
+        if (BeginCurrentDynamicCellEdit(e))
+        {
+            e.Handled = true;
+        }
+    }
+
+    private void BomGrid_OnPreviewMouseRightButtonDown(object sender, MouseButtonEventArgs e)
+    {
+        var cell = FindParent<DataGridCell>(e.OriginalSource as DependencyObject);
+        if (cell is null)
+        {
+            return;
+        }
+
+        if (!cell.IsSelected)
+        {
+            BomGrid.SelectedCells.Clear();
+            cell.IsSelected = true;
+            cell.Focus();
+            BomGrid.CurrentCell = new DataGridCellInfo(cell);
+        }
+    }
+
+    private void BomGrid_OnCellEditEnding(object? sender, DataGridCellEditEndingEventArgs e)
+    {
+        // Do not refresh here: CollectionView is still inside the edit transaction.
+    }
+
+    private void BomGrid_OnSelectedCellsChanged(object sender, SelectedCellsChangedEventArgs e)
+    {
+        var row = e.AddedCells
+            .Select(x => x.Item)
+            .OfType<BomRow>()
+            .FirstOrDefault();
+        if (row is not null)
+        {
+            _thumbnailRow = row;
+            BomGrid.CurrentCell = e.AddedCells.First(x => x.Item == row);
+        }
+
+        UpdateThumbnailWindow();
+    }
+
+    private void BomGrid_OnCurrentCellChanged(object? sender, EventArgs e)
+    {
+        if (BomGrid.CurrentCell.Item is BomRow row)
+        {
+            _thumbnailRow = row;
+        }
+
+        UpdateThumbnailWindow();
+    }
+
+    private void UpdateThumbnailWindow()
+    {
+        if (!_thumbnailEnabled || _thumbnailWindow is null)
+        {
+            return;
+        }
+
+        var row = BomGrid.CurrentCell.Item as BomRow
+                  ?? _thumbnailRow
+                  ?? BomGrid.SelectedCells.Select(x => x.Item).OfType<BomRow>().FirstOrDefault();
+        _thumbnailRow = row;
+        _thumbnailWindow.UpdateRow(row);
+    }
+
+    private void CopyCellsMenuItem_OnClick(object sender, RoutedEventArgs e)
+    {
+        CopySelectedCellsToClipboard();
+    }
+
+    private void PasteCellsMenuItem_OnClick(object sender, RoutedEventArgs e)
+    {
+        PasteClipboardToDynamicCells();
     }
 
     private ColumnOption? ShowColumnSelectionDialog(string title, string label, bool includeAllOption)
@@ -542,6 +880,36 @@ public partial class MainWindow : Window
             : null;
     }
 
+    private ColumnOption? ShowBlankSizeColumnDialog()
+    {
+        var options = GetDynamicColumnOptions(includeAllOption: false);
+        if (options.Count == 0)
+        {
+            MessageBox.Show(this, "没有可关联的 TXT 属性列，请先在 property-mapping.txt 中配置属性并读取 BOM。", "提示", MessageBoxButton.OK, MessageBoxImage.Information);
+            return null;
+        }
+
+        var comboBox = CreateColumnComboBox(options);
+        SelectColumnByPropertyName(comboBox, "下料尺寸");
+
+        var window = CreateToolDialog("计算下料尺寸", 380, 180);
+        var panel = CreateDialogPanel();
+        panel.Children.Add(new TextBlock { Text = "目标属性列", Margin = new Thickness(0, 0, 0, 6) });
+        panel.Children.Add(comboBox);
+        panel.Children.Add(new TextBlock
+        {
+            Text = "仅计算并填入当前表格中目标列为空的项目。",
+            Foreground = Brushes.DimGray,
+            TextWrapping = TextWrapping.Wrap
+        });
+        AddDialogButtons(panel, window);
+        window.Content = panel;
+
+        return window.ShowDialog() == true && comboBox.SelectedItem is ColumnOption target
+            ? target
+            : null;
+    }
+
     private List<ColumnOption> GetDynamicColumnOptions(bool includeAllOption)
     {
         var options = _dynamicPropertyColumns
@@ -593,6 +961,18 @@ public partial class MainWindow : Window
         }
     }
 
+    private static void SelectColumnByPropertyName(ComboBox comboBox, string propertyName)
+    {
+        foreach (var item in comboBox.Items)
+        {
+            if (item is ColumnOption option && string.Equals(option.PropertyName, propertyName, StringComparison.OrdinalIgnoreCase))
+            {
+                comboBox.SelectedItem = option;
+                return;
+            }
+        }
+    }
+
     private Window CreateToolDialog(string title, double width, double height)
     {
         return new Window
@@ -631,9 +1011,14 @@ public partial class MainWindow : Window
     private void OpenHeaderFilterMenu(DataGridColumnHeader header, string propertyName)
     {
         var current = _headerFilters.TryGetValue(propertyName, out var value) ? value : string.Empty;
+        var values = GetColumnDistinctValues(propertyName);
+        var selectedValues = _headerValueFilters.TryGetValue(propertyName, out var storedValues)
+            ? new HashSet<string>(storedValues, StringComparer.Ordinal)
+            : new HashSet<string>(values, StringComparer.Ordinal);
+
         var textBox = new TextBox
         {
-            Width = 180,
+            Width = 260,
             Text = current,
             Margin = new Thickness(0, 6, 0, 8)
         };
@@ -645,9 +1030,66 @@ public partial class MainWindow : Window
             StaysOpen = true
         };
 
-        var panel = new StackPanel { Width = 220, Margin = new Thickness(10) };
-        panel.Children.Add(new TextBlock { Text = $"筛选: {header.Column.Header}", FontWeight = FontWeights.SemiBold });
+        var panel = new StackPanel { Width = 300, Margin = new Thickness(10) };
+        panel.Children.Add(new TextBlock { Text = $"筛选: {GetColumnHeaderText(header.Column)}", FontWeight = FontWeights.SemiBold });
+        panel.Children.Add(new TextBlock { Text = "文本包含", Margin = new Thickness(0, 8, 0, 0), Foreground = Brushes.DimGray });
         panel.Children.Add(textBox);
+
+        var selectAll = new CheckBox
+        {
+            Content = "全选",
+            IsChecked = values.Count == 0 || selectedValues.Count == values.Count,
+            Margin = new Thickness(0, 0, 0, 6)
+        };
+        panel.Children.Add(selectAll);
+
+        var valuePanel = new StackPanel();
+        var checkBoxes = new List<CheckBox>();
+        foreach (var columnValue in values)
+        {
+            var checkBox = new CheckBox
+            {
+                Content = string.IsNullOrEmpty(columnValue) ? "(空白)" : columnValue,
+                Tag = columnValue,
+                IsChecked = selectedValues.Contains(columnValue),
+                Margin = new Thickness(0, 0, 0, 4)
+            };
+            checkBox.Checked += (_, _) => UpdateSelectAllCheckBox(selectAll, checkBoxes);
+            checkBox.Unchecked += (_, _) => UpdateSelectAllCheckBox(selectAll, checkBoxes);
+            checkBoxes.Add(checkBox);
+            valuePanel.Children.Add(checkBox);
+        }
+
+        selectAll.Checked += (_, _) =>
+        {
+            foreach (var checkBox in checkBoxes)
+            {
+                checkBox.IsChecked = true;
+            }
+        };
+        selectAll.Unchecked += (_, _) =>
+        {
+            if (!selectAll.IsKeyboardFocusWithin && !selectAll.IsMouseOver)
+            {
+                return;
+            }
+
+            foreach (var checkBox in checkBoxes)
+            {
+                checkBox.IsChecked = false;
+            }
+        };
+
+        panel.Children.Add(new TextBlock { Text = "值筛选", Margin = new Thickness(0, 4, 0, 6), Foreground = Brushes.DimGray });
+        panel.Children.Add(new ScrollViewer
+        {
+            Content = valuePanel,
+            Height = 220,
+            VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+            BorderBrush = Brushes.LightGray,
+            BorderThickness = new Thickness(1),
+            Padding = new Thickness(6)
+        });
 
         var buttons = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right };
         var applyButton = new Button { Content = "应用", Width = 64, Height = 28, Margin = new Thickness(0, 0, 8, 0) };
@@ -668,14 +1110,30 @@ public partial class MainWindow : Window
                 _headerFilters[propertyName] = filter;
             }
 
+            var checkedValues = checkBoxes
+                .Where(x => x.IsChecked == true)
+                .Select(x => (string)x.Tag)
+                .ToHashSet(StringComparer.Ordinal);
+            if (checkedValues.Count == values.Count)
+            {
+                _headerValueFilters.Remove(propertyName);
+            }
+            else
+            {
+                _headerValueFilters[propertyName] = checkedValues;
+            }
+
             ApplyHeaderFilters();
+            UpdateHeaderFilterButtons();
             menu.IsOpen = false;
         };
 
         clearButton.Click += (_, _) =>
         {
             _headerFilters.Remove(propertyName);
+            _headerValueFilters.Remove(propertyName);
             ApplyHeaderFilters();
+            UpdateHeaderFilterButtons();
             menu.IsOpen = false;
         };
 
@@ -692,7 +1150,7 @@ public partial class MainWindow : Window
             return;
         }
 
-        if (_headerFilters.Count == 0)
+        if (_headerFilters.Count == 0 && _headerValueFilters.Count == 0)
         {
             _view.Filter = null;
         }
@@ -713,12 +1171,20 @@ public partial class MainWindow : Window
                     }
                 }
 
+                foreach (var filter in _headerValueFilters)
+                {
+                    if (!filter.Value.Contains(GetCellValue(row, filter.Key)))
+                    {
+                        return false;
+                    }
+                }
+
                 return true;
             };
         }
 
         _view.Refresh();
-        SetStatus(_headerFilters.Count == 0 ? $"读取完成: {_rows.Count} 项" : $"过滤后: {GetVisibleRows().Count} 项");
+        SetStatus(_headerFilters.Count == 0 && _headerValueFilters.Count == 0 ? $"读取完成: {_rows.Count} 项" : $"过滤后: {GetVisibleRows().Count} 项");
     }
 
     private string GetColumnPropertyName(DataGridColumn column)
@@ -734,12 +1200,123 @@ public partial class MainWindow : Window
             return binding.Path.Path;
         }
 
-        return column.Header?.ToString() switch
+        return GetColumnHeaderText(column) switch
         {
             "类型" => nameof(BomRow.DocumentType),
             "工程图" => nameof(BomRow.DrawingStatus),
             _ => string.Empty
         };
+    }
+
+    private string GetColumnHeaderText(DataGridColumn column)
+    {
+        var header = _columnOriginalHeaders.TryGetValue(column, out var originalHeader)
+            ? originalHeader
+            : column.Header;
+
+        return header?.ToString() ?? string.Empty;
+    }
+
+    private List<string> GetColumnDistinctValues(string propertyName)
+    {
+        return _rows
+            .Select(row => GetCellValue(row, propertyName))
+            .Distinct(StringComparer.Ordinal)
+            .OrderBy(x => string.IsNullOrEmpty(x) ? 0 : 1)
+            .ThenBy(x => x, StringComparer.CurrentCultureIgnoreCase)
+            .ToList();
+    }
+
+    private static void UpdateSelectAllCheckBox(CheckBox selectAll, IReadOnlyCollection<CheckBox> checkBoxes)
+    {
+        if (checkBoxes.Count == 0)
+        {
+            selectAll.IsChecked = true;
+            return;
+        }
+
+        var checkedCount = checkBoxes.Count(x => x.IsChecked == true);
+        selectAll.IsChecked = checkedCount == checkBoxes.Count;
+    }
+
+    private DataGridColumnHeader? FindColumnHeader(DataGridColumn column)
+    {
+        BomGrid.UpdateLayout();
+        return FindVisualChildren<DataGridColumnHeader>(BomGrid)
+            .FirstOrDefault(header => header.Column == column);
+    }
+
+    private static IEnumerable<T> FindVisualChildren<T>(DependencyObject current) where T : DependencyObject
+    {
+        for (var i = 0; i < VisualTreeHelper.GetChildrenCount(current); i++)
+        {
+            var child = VisualTreeHelper.GetChild(current, i);
+            if (child is T typed)
+            {
+                yield return typed;
+            }
+
+            foreach (var descendant in FindVisualChildren<T>(child))
+            {
+                yield return descendant;
+            }
+        }
+    }
+
+    private void UpdateHeaderFilterButtons()
+    {
+        foreach (var column in BomGrid.Columns)
+        {
+            if (!_columnOriginalHeaders.ContainsKey(column))
+            {
+                _columnOriginalHeaders[column] = column.Header ?? string.Empty;
+            }
+
+            if (!_headerFilterEnabled)
+            {
+                column.Header = _columnOriginalHeaders[column];
+                continue;
+            }
+
+            var propertyName = GetColumnPropertyName(column);
+            if (string.IsNullOrWhiteSpace(propertyName))
+            {
+                column.Header = _columnOriginalHeaders[column];
+                continue;
+            }
+
+            var isActive = _headerFilters.ContainsKey(propertyName) || _headerValueFilters.ContainsKey(propertyName);
+            var button = new Button
+            {
+                Content = "▼",
+                Width = 22,
+                Height = 22,
+                Padding = new Thickness(0),
+                Margin = new Thickness(6, 0, 0, 0),
+                Tag = column,
+                ToolTip = "筛选",
+                Foreground = isActive ? Brushes.White : Brushes.DimGray,
+                Background = isActive ? Brushes.SteelBlue : Brushes.Transparent,
+                BorderBrush = isActive ? Brushes.SteelBlue : Brushes.LightGray
+            };
+            button.Click += HeaderFilterGlyph_OnClick;
+
+            column.Header = new DockPanel
+            {
+                LastChildFill = true,
+                Children =
+                {
+                    button,
+                    new TextBlock
+                    {
+                        Text = GetColumnHeaderText(column),
+                        VerticalAlignment = VerticalAlignment.Center,
+                        TextTrimming = TextTrimming.CharacterEllipsis
+                    }
+                }
+            };
+            DockPanel.SetDock(button, Dock.Right);
+        }
     }
 
     private string GetDynamicColumnPropertyName(DataGridColumn column)
@@ -876,7 +1453,7 @@ public partial class MainWindow : Window
             var fillChanged = FillSelectedDynamicCells(cells, matrix[0][0]);
             if (fillChanged > 0)
             {
-                BomGrid.Items.Refresh();
+                RefreshBomGridSafely();
                 AppendLog($"粘贴TXT属性: {fillChanged} 个单元格");
                 return true;
             }
@@ -910,8 +1487,43 @@ public partial class MainWindow : Window
             return false;
         }
 
-        BomGrid.Items.Refresh();
+        RefreshBomGridSafely();
         AppendLog($"粘贴TXT属性: {changed} 个单元格");
+        return true;
+    }
+
+    private bool BeginCurrentDynamicCellEdit(RoutedEventArgs editingEventArgs)
+    {
+        if (BomGrid.CurrentCell.Item is not BomRow || BomGrid.CurrentCell.Column is null)
+        {
+            return false;
+        }
+
+        if (string.IsNullOrWhiteSpace(GetDynamicColumnPropertyName(BomGrid.CurrentCell.Column)))
+        {
+            return false;
+        }
+
+        BomGrid.Focus();
+        return BomGrid.BeginEdit(editingEventArgs);
+    }
+
+    private bool ClearSelectedDynamicCells()
+    {
+        var cells = GetOrderedSelectedCells();
+        if (cells.Count == 0 && BomGrid.CurrentCell.Item is BomRow currentRow && BomGrid.CurrentCell.Column is not null)
+        {
+            cells.Add(new DataGridCellInfo(currentRow, BomGrid.CurrentCell.Column));
+        }
+
+        var changed = FillSelectedDynamicCells(cells, string.Empty);
+        if (changed == 0)
+        {
+            return false;
+        }
+
+        RefreshBomGridSafely();
+        AppendLog($"清空TXT属性: {changed} 个单元格");
         return true;
     }
 
@@ -1017,10 +1629,28 @@ public partial class MainWindow : Window
         LogTextBox.Document.Blocks.Clear();
     }
 
+    private void RefreshBomGridSafely()
+    {
+        BomGrid.CommitEdit(DataGridEditingUnit.Cell, true);
+        BomGrid.CommitEdit(DataGridEditingUnit.Row, true);
+        Dispatcher.BeginInvoke(new Action(() =>
+        {
+            try
+            {
+                BomGrid.Items.Refresh();
+            }
+            catch (InvalidOperationException)
+            {
+                Dispatcher.BeginInvoke(new Action(RefreshBomGridSafely), System.Windows.Threading.DispatcherPriority.Background);
+            }
+        }), System.Windows.Threading.DispatcherPriority.Background);
+    }
+
     private void ClearBomRows()
     {
         _rows.Clear();
         _headerFilters.Clear();
+        _headerValueFilters.Clear();
         if (_view is not null)
         {
             _view.Filter = null;
@@ -1028,6 +1658,7 @@ public partial class MainWindow : Window
         }
 
         HeaderFilterButton.Content = _headerFilterEnabled ? "关闭筛选" : "表头筛选";
+        UpdateHeaderFilterButtons();
         ResetReadProgress();
         ProgressText.Text = "就绪";
         ReadProgressBar.IsIndeterminate = false;
@@ -1167,6 +1798,17 @@ public partial class MainWindow : Window
         });
         LogTextBox.Document.Blocks.Add(paragraph);
         LogTextBox.ScrollToEnd();
+    }
+
+    private async Task AppendAddinConnectionStatusAsync()
+    {
+        if (await SolidWorksAddinClient.IsAvailableAsync())
+        {
+            AppendLog("插件连接状态: 已连接");
+            return;
+        }
+
+        AppendLog("插件连接状态: 未连接", Brushes.Red);
     }
 
     private static bool IsUnsavedDocumentTitle(string title)
@@ -1325,18 +1967,25 @@ public partial class MainWindow : Window
 
         foreach (var propertyName in _propertyMapping.PropertyNames)
         {
-            var column = new DataGridTemplateColumn
+            var column = new DataGridTextColumn
             {
                 Header = GetPropertyDisplayName(propertyName),
-                CellTemplate = CreateEditablePropertyTemplate(propertyName),
+                Binding = new Binding($"Properties[{propertyName}]")
+                {
+                    Mode = BindingMode.TwoWay,
+                    UpdateSourceTrigger = UpdateSourceTrigger.PropertyChanged
+                },
                 CellStyle = CreateChangedPropertyCellStyle(propertyName),
-                Width = DataGridLength.Auto,
-                MinWidth = GetPropertyColumnMinWidth(propertyName),
+                ElementStyle = CreatePropertyTextElementStyle(),
+                EditingElementStyle = CreatePropertyTextEditingStyle(),
+                Width = new DataGridLength(GetPropertyColumnMinWidth(propertyName)),
                 IsReadOnly = false
             };
             _dynamicPropertyColumns[column] = propertyName;
             BomGrid.Columns.Insert(insertIndex++, column);
         }
+
+        UpdateHeaderFilterButtons();
     }
 
     private bool IsDynamicPropertyColumn(DataGridColumn column)
@@ -1359,6 +2008,25 @@ public partial class MainWindow : Window
         }
 
         return binding.Path?.Path.StartsWith("Properties[", StringComparison.OrdinalIgnoreCase) == true;
+    }
+
+    private static Style CreatePropertyTextElementStyle()
+    {
+        var style = new Style(typeof(TextBlock));
+        style.Setters.Add(new Setter(FrameworkElement.VerticalAlignmentProperty, VerticalAlignment.Center));
+        style.Setters.Add(new Setter(TextBlock.PaddingProperty, new Thickness(2, 0, 2, 0)));
+        style.Setters.Add(new Setter(TextBlock.TextTrimmingProperty, TextTrimming.CharacterEllipsis));
+        return style;
+    }
+
+    private static Style CreatePropertyTextEditingStyle()
+    {
+        var style = new Style(typeof(TextBox));
+        style.Setters.Add(new Setter(Control.BorderThicknessProperty, new Thickness(0)));
+        style.Setters.Add(new Setter(Control.PaddingProperty, new Thickness(2, 0, 2, 0)));
+        style.Setters.Add(new Setter(Control.BackgroundProperty, Brushes.White));
+        style.Setters.Add(new Setter(TextBox.VerticalContentAlignmentProperty, VerticalAlignment.Center));
+        return style;
     }
 
     private static DataTemplate CreateEditablePropertyTemplate(string propertyName)
@@ -1558,6 +2226,10 @@ public sealed record ReadProgress(string Message, int Completed, int Total);
 
 public sealed record SaveResult(int TotalRows, int SavedRows, int FailedRows, int SavedProperties);
 
+public sealed record RelocateResult(int TotalRows, int CopiedFiles, int ReloadedRows, int FailedRows);
+
+public sealed record BlankSizeResult(int TotalRows, int UpdatedRows, int FailedRows);
+
 public sealed record PropertyChange(string Name, string Value);
 
 public sealed class PropertyMappingConfig
@@ -1675,7 +2347,26 @@ public sealed class BomRow
     public Dictionary<string, string> Properties { get; init; } = new(StringComparer.OrdinalIgnoreCase);
     public Dictionary<string, string> OriginalProperties { get; init; } = new(StringComparer.OrdinalIgnoreCase);
     public List<string> AvailablePropertyNames { get; init; } = [];
-    public string FullPath { get; init; } = string.Empty;
+    public string FullPath { get; set; } = string.Empty;
+    public string DirectoryPath
+    {
+        get
+        {
+            if (string.IsNullOrWhiteSpace(FullPath))
+            {
+                return string.Empty;
+            }
+
+            try
+            {
+                return Path.GetDirectoryName(FullPath) ?? string.Empty;
+            }
+            catch
+            {
+                return string.Empty;
+            }
+        }
+    }
     public bool IsOutsideMainAssemblyDirectory { get; set; }
     public bool HasUnsetMaterial { get; set; }
     public bool HasValidationWarning => IsOutsideMainAssemblyDirectory || HasUnsetMaterial;
@@ -1757,6 +2448,780 @@ public sealed class BomPropertyChangedConverter : IValueConverter
     public object ConvertBack(object value, Type targetType, object parameter, CultureInfo culture)
     {
         return Binding.DoNothing;
+    }
+}
+
+public sealed class ThumbnailPreviewWindow : Window
+{
+    private readonly Image _image;
+    private readonly TextBlock _title;
+    private readonly TextBlock _path;
+    private readonly TextBlock _message;
+    private readonly Button _pinButton;
+
+    public ThumbnailPreviewWindow()
+    {
+        Title = "零件缩略图";
+        Width = 360;
+        Height = 420;
+        MinWidth = 280;
+        MinHeight = 320;
+        WindowStartupLocation = WindowStartupLocation.Manual;
+        ShowInTaskbar = true;
+        ShowActivated = true;
+        Topmost = true;
+
+        _title = new TextBlock
+        {
+            FontWeight = FontWeights.SemiBold,
+            TextTrimming = TextTrimming.CharacterEllipsis,
+            Margin = new Thickness(0, 0, 0, 6)
+        };
+        _path = new TextBlock
+        {
+            Foreground = Brushes.DimGray,
+            TextWrapping = TextWrapping.Wrap,
+            FontSize = 12,
+            Margin = new Thickness(0, 0, 0, 10)
+        };
+        _image = new Image
+        {
+            Stretch = Stretch.Uniform,
+            HorizontalAlignment = HorizontalAlignment.Stretch,
+            VerticalAlignment = VerticalAlignment.Stretch
+        };
+        _message = new TextBlock
+        {
+            Text = "未选择项目",
+            Foreground = Brushes.DimGray,
+            HorizontalAlignment = HorizontalAlignment.Center,
+            VerticalAlignment = VerticalAlignment.Center,
+            TextWrapping = TextWrapping.Wrap
+        };
+        _pinButton = new Button
+        {
+            Content = "📌",
+            Width = 28,
+            Height = 24,
+            Padding = new Thickness(0),
+            Margin = new Thickness(8, 0, 0, 6),
+            ToolTip = "置顶",
+            VerticalAlignment = VerticalAlignment.Top
+        };
+        _pinButton.Click += (_, _) => TogglePin();
+        ApplyPinVisualState();
+
+        var header = new DockPanel();
+        DockPanel.SetDock(_pinButton, Dock.Right);
+        header.Children.Add(_pinButton);
+        header.Children.Add(_title);
+
+        var previewBorder = new Border
+        {
+            BorderBrush = Brushes.LightGray,
+            BorderThickness = new Thickness(1),
+            Background = Brushes.White,
+            Padding = new Thickness(8),
+            Child = new Grid
+            {
+                Children =
+                {
+                    _image,
+                    _message
+                }
+            }
+        };
+        Grid.SetRow(previewBorder, 2);
+
+        Content = new Grid
+        {
+            Margin = new Thickness(12),
+            RowDefinitions =
+            {
+                new RowDefinition { Height = GridLength.Auto },
+                new RowDefinition { Height = GridLength.Auto },
+                new RowDefinition { Height = new GridLength(1, GridUnitType.Star) }
+            },
+            Children =
+            {
+                header,
+                _path,
+                previewBorder
+            }
+        };
+        Grid.SetRow(_path, 1);
+    }
+
+    public void UpdateRow(BomRow? row)
+    {
+        if (row is null)
+        {
+            _title.Text = "未选择项目";
+            _path.Text = string.Empty;
+            _image.Source = null;
+            _message.Text = "未选择项目";
+            _message.Visibility = Visibility.Visible;
+            return;
+        }
+
+        _title.Text = string.IsNullOrWhiteSpace(row.FileName) ? row.FullPath : row.FileName;
+        _path.Text = row.FullPath;
+        var image = ShellThumbnailReader.TryGetThumbnail(row.FullPath, 320);
+        _image.Source = image;
+        _message.Text = image is null ? "没有可用缩略图" : string.Empty;
+        _message.Visibility = image is null ? Visibility.Visible : Visibility.Collapsed;
+    }
+
+    private void TogglePin()
+    {
+        Topmost = !Topmost;
+        ApplyPinVisualState();
+    }
+
+    private void ApplyPinVisualState()
+    {
+        _pinButton.Background = Topmost ? Brushes.SteelBlue : SystemColors.ControlBrush;
+        _pinButton.Foreground = Topmost ? Brushes.White : SystemColors.ControlTextBrush;
+        _pinButton.ToolTip = Topmost ? "取消置顶" : "置顶";
+    }
+}
+
+internal static class ShellThumbnailReader
+{
+    [Flags]
+    private enum ThumbnailFlags
+    {
+        ResizeToFit = 0,
+        BiggerSizeOk = 1,
+        IconOnly = 4,
+        ThumbnailOnly = 8
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct NativeSize
+    {
+        public int Cx;
+        public int Cy;
+    }
+
+    [ComImport]
+    [Guid("bcc18b79-ba16-442f-80c4-8a59c30c463b")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    private interface IShellItemImageFactory
+    {
+        void GetImage(NativeSize size, ThumbnailFlags flags, out IntPtr phbm);
+    }
+
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode, PreserveSig = false)]
+    private static extern void SHCreateItemFromParsingName(
+        string pszPath,
+        IntPtr pbc,
+        [MarshalAs(UnmanagedType.LPStruct)] Guid riid,
+        out IShellItemImageFactory ppv);
+
+    [DllImport("gdi32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool DeleteObject(IntPtr hObject);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool DestroyIcon(IntPtr hIcon);
+
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
+    private static extern IntPtr SHGetFileInfo(
+        string pszPath,
+        uint dwFileAttributes,
+        ref ShellFileInfo psfi,
+        uint cbFileInfo,
+        uint uFlags);
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct ShellFileInfo
+    {
+        public IntPtr hIcon;
+        public int iIcon;
+        public uint dwAttributes;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)]
+        public string szDisplayName;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 80)]
+        public string szTypeName;
+    }
+
+    private const uint ShgfiIcon = 0x000000100;
+    private const uint ShgfiLargeIcon = 0x000000000;
+
+    public static BitmapSource? TryGetThumbnail(string path, int size)
+    {
+        if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
+        {
+            return null;
+        }
+
+        try
+        {
+            var iid = typeof(IShellItemImageFactory).GUID;
+            SHCreateItemFromParsingName(path, IntPtr.Zero, iid, out var factory);
+            var nativeSize = new NativeSize { Cx = size, Cy = size };
+            factory.GetImage(nativeSize, ThumbnailFlags.ThumbnailOnly | ThumbnailFlags.BiggerSizeOk, out var hBitmap);
+            try
+            {
+                var source = Imaging.CreateBitmapSourceFromHBitmap(
+                    hBitmap,
+                    IntPtr.Zero,
+                    Int32Rect.Empty,
+                    BitmapSizeOptions.FromEmptyOptions());
+                source.Freeze();
+                return source;
+            }
+            finally
+            {
+                DeleteObject(hBitmap);
+            }
+        }
+        catch
+        {
+            return TryGetFileIcon(path);
+        }
+    }
+
+    private static BitmapSource? TryGetFileIcon(string path)
+    {
+        try
+        {
+            var info = new ShellFileInfo();
+            var result = SHGetFileInfo(path, 0, ref info, (uint)Marshal.SizeOf<ShellFileInfo>(), ShgfiIcon | ShgfiLargeIcon);
+            if (result == IntPtr.Zero || info.hIcon == IntPtr.Zero)
+            {
+                return null;
+            }
+
+            try
+            {
+                var source = Imaging.CreateBitmapSourceFromHIcon(
+                    info.hIcon,
+                    Int32Rect.Empty,
+                    BitmapSizeOptions.FromWidthAndHeight(96, 96));
+                source.Freeze();
+                return source;
+            }
+            finally
+            {
+                DestroyIcon(info.hIcon);
+            }
+        }
+        catch
+        {
+            return null;
+        }
+    }
+}
+
+internal static class SolidWorksAddinClient
+{
+    private static readonly HttpClient Client = new() { Timeout = Timeout.InfiniteTimeSpan };
+    private static readonly Uri BaseUri = new("http://127.0.0.1:32127/");
+    private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)
+    {
+        PropertyNameCaseInsensitive = true
+    };
+
+    public static async Task<bool> IsAvailableAsync()
+    {
+        try
+        {
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+            using var response = await Client.GetAsync(new Uri(BaseUri, "health"), cts.Token);
+            return response.IsSuccessStatusCode;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    public static async Task<List<BomRow>> ReadBomAsync(
+        IReadOnlyList<string> propertyNames,
+        ReadOptions options,
+        Action<ReadProgress>? progress = null,
+        Action<string>? log = null)
+    {
+        progress?.Invoke(new ReadProgress("Add-in读取BOM", 0, 1));
+        var request = new
+        {
+            Command = "read-bom",
+            PropertyNames = propertyNames.ToArray(),
+            GroupByConfig = options.GroupByConfig,
+            SkipVirtual = options.SkipVirtual
+        };
+        var requestWatch = Stopwatch.StartNew();
+        var response = await PostCommandAsync<ReadBomResponse>(request, TimeSpan.FromMinutes(10), log);
+        log?.Invoke($"Add-in计时: HTTP请求到响应对象 {requestWatch.ElapsedMilliseconds}ms");
+
+        var convertWatch = Stopwatch.StartNew();
+        var rows = new List<BomRow>();
+        if (!string.IsNullOrWhiteSpace(response.TableCsv?.CsvText))
+        {
+            rows.AddRange(CreateBomRowsFromCsv(response.TableCsv, propertyNames, log));
+        }
+        else if (response.Table?.Rows is { Count: > 0 } tableRows)
+        {
+            var tablePropertyNames = response.Table.PropertyNames ?? propertyNames.ToList();
+            foreach (var row in tableRows)
+            {
+                rows.Add(CreateBomRowFromAddin(row, tablePropertyNames));
+            }
+        }
+        else
+        {
+            foreach (var row in response.Rows ?? [])
+            {
+                rows.Add(CreateBomRowFromAddin(row, propertyNames));
+            }
+        }
+
+        log?.Invoke($"Add-in计时: 主程序转换BomRow {rows.Count} 行 {convertWatch.ElapsedMilliseconds}ms");
+        progress?.Invoke(new ReadProgress("Add-in读取BOM", 1, 1));
+        return rows;
+    }
+
+    private static BomRow CreateBomRowFromAddin(AddinBomRow row, IReadOnlyList<string> fallbackPropertyNames)
+    {
+        var properties = new Dictionary<string, string>(
+            row.Properties ?? new Dictionary<string, string>(),
+            StringComparer.OrdinalIgnoreCase);
+        var available = row.AvailablePropertyNames is { Count: > 0 }
+            ? row.AvailablePropertyNames
+            : fallbackPropertyNames
+                .Where(name => !string.IsNullOrWhiteSpace(name))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+        foreach (var name in available)
+        {
+            if (!properties.ContainsKey(name))
+            {
+                properties[name] = string.Empty;
+            }
+        }
+
+        return new BomRow
+        {
+            DocumentType = row.DocumentType ?? string.Empty,
+            DocumentIconPath = GetDocumentIconPathFromLabel(row.DocumentType),
+            DrawingStatus = row.DrawingStatus ?? string.Empty,
+            DrawingIconPath = string.Empty,
+            FileName = row.FileName ?? string.Empty,
+            Configuration = string.IsNullOrWhiteSpace(row.Configuration) ? "Default" : row.Configuration,
+            Quantity = row.Quantity,
+            Material = GetMaterialDisplay(row.DocumentType, row.Material),
+            Properties = new Dictionary<string, string>(properties, StringComparer.OrdinalIgnoreCase),
+            OriginalProperties = new Dictionary<string, string>(properties, StringComparer.OrdinalIgnoreCase),
+            AvailablePropertyNames = available,
+            FullPath = row.FullPath ?? string.Empty
+        };
+    }
+
+    private static List<BomRow> CreateBomRowsFromCsv(AddinBomCsvTable table, IReadOnlyList<string> fallbackPropertyNames, Action<string>? log)
+    {
+        var parseWatch = Stopwatch.StartNew();
+        var records = ParseDelimitedText(table.CsvText ?? string.Empty, table.Separator);
+        log?.Invoke($"Add-in计时: CSV解析 {records.Count} 行 {parseWatch.ElapsedMilliseconds}ms");
+        if (records.Count == 0)
+        {
+            return [];
+        }
+
+        var propertyNames = table.PropertyNames is { Count: > 0 }
+            ? table.PropertyNames
+            : fallbackPropertyNames
+                .Where(name => !string.IsNullOrWhiteSpace(name))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+        var headerIndex = FindCsvHeaderRow(records, propertyNames);
+        var headers = records[headerIndex].Select(NormalizeCsvHeader).ToList();
+        var quantityIndex = FindCsvColumn(headers, "数量", "QTY", "QTY.", "Quantity");
+        var fileNameIndex = FindCsvColumn(headers, "零件号", "零件编号", "Part Number", "PART NUMBER", "文件名", "File Name", "名称");
+        var configurationIndex = FindCsvColumn(headers, "配置", "Configuration", "Config");
+        var fullPathIndex = FindCsvColumn(headers, "完整路径", "FullPath", "Path");
+        var materialIndex = FindCsvColumn(headers, "SW材料", "SW-Material");
+        var propertyIndexes = propertyNames.ToDictionary(name => name, name => FindCsvColumn(headers, name), StringComparer.OrdinalIgnoreCase);
+
+        var rows = new List<BomRow>();
+        if (!string.IsNullOrWhiteSpace(table.MainPath))
+        {
+            var mainProperties = CreateEmptyProperties(propertyNames);
+            rows.Add(new BomRow
+            {
+                DocumentType = "装配体",
+                DocumentIconPath = GetDocumentIconPathFromLabel("装配体"),
+                DrawingStatus = string.Empty,
+                DrawingIconPath = string.Empty,
+                FileName = Path.GetFileNameWithoutExtension(table.MainPath),
+                Configuration = string.IsNullOrWhiteSpace(table.MainConfiguration) ? "Default" : table.MainConfiguration,
+                Quantity = 1,
+                Material = "无需设置",
+                Properties = mainProperties,
+                OriginalProperties = new Dictionary<string, string>(mainProperties, StringComparer.OrdinalIgnoreCase),
+                AvailablePropertyNames = propertyNames.ToList(),
+                FullPath = table.MainPath
+            });
+        }
+
+        for (var rowIndex = headerIndex + 1; rowIndex < records.Count; rowIndex++)
+        {
+            var record = records[rowIndex];
+            if (record.All(string.IsNullOrWhiteSpace))
+            {
+                continue;
+            }
+
+            var fullPath = GetCsvCell(record, fullPathIndex);
+            var rawFileName = GetCsvCell(record, fileNameIndex);
+            if (string.IsNullOrWhiteSpace(rawFileName))
+            {
+                rawFileName = PickCsvDisplayName(record, headers, quantityIndex, materialIndex, propertyIndexes.Values);
+            }
+
+            var documentType = InferDocumentType(fullPath, rawFileName);
+            var properties = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var propertyName in propertyNames)
+            {
+                properties[propertyName] = propertyIndexes.TryGetValue(propertyName, out var index)
+                    ? GetCsvCell(record, index)
+                    : string.Empty;
+            }
+
+            rows.Add(new BomRow
+            {
+                DocumentType = documentType,
+                DocumentIconPath = GetDocumentIconPathFromLabel(documentType),
+                DrawingStatus = string.Empty,
+                DrawingIconPath = string.Empty,
+                FileName = NormalizeCsvFileName(rawFileName, fullPath),
+                Configuration = string.IsNullOrWhiteSpace(GetCsvCell(record, configurationIndex)) ? "Default" : GetCsvCell(record, configurationIndex),
+                Quantity = ParseCsvQuantity(GetCsvCell(record, quantityIndex)),
+                Material = GetMaterialDisplay(documentType, GetCsvCell(record, materialIndex)),
+                Properties = properties,
+                OriginalProperties = new Dictionary<string, string>(properties, StringComparer.OrdinalIgnoreCase),
+                AvailablePropertyNames = propertyNames.ToList(),
+                FullPath = fullPath
+            });
+        }
+
+        log?.Invoke($"Add-in计时: CSV转BomRow {rows.Count} 行，headerRow={headerIndex + 1}");
+        return rows;
+    }
+
+    private static Dictionary<string, string> CreateEmptyProperties(IReadOnlyList<string> propertyNames)
+    {
+        var properties = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var propertyName in propertyNames)
+        {
+            properties[propertyName] = string.Empty;
+        }
+
+        return properties;
+    }
+
+    private static List<List<string>> ParseDelimitedText(string text, string? separator)
+    {
+        var delimiter = string.IsNullOrEmpty(separator) ? ',' : separator[0];
+        var rows = new List<List<string>>();
+        var row = new List<string>();
+        var cell = new StringBuilder();
+        var inQuotes = false;
+
+        for (var i = 0; i < text.Length; i++)
+        {
+            var ch = text[i];
+            if (inQuotes)
+            {
+                if (ch == '"' && i + 1 < text.Length && text[i + 1] == '"')
+                {
+                    cell.Append('"');
+                    i++;
+                }
+                else if (ch == '"')
+                {
+                    inQuotes = false;
+                }
+                else
+                {
+                    cell.Append(ch);
+                }
+
+                continue;
+            }
+
+            if (ch == '"')
+            {
+                inQuotes = true;
+            }
+            else if (ch == delimiter)
+            {
+                row.Add(cell.ToString());
+                cell.Clear();
+            }
+            else if (ch == '\r' || ch == '\n')
+            {
+                row.Add(cell.ToString());
+                cell.Clear();
+                if (row.Any(value => value.Length > 0))
+                {
+                    rows.Add(row);
+                }
+
+                row = new List<string>();
+                if (ch == '\r' && i + 1 < text.Length && text[i + 1] == '\n')
+                {
+                    i++;
+                }
+            }
+            else
+            {
+                cell.Append(ch);
+            }
+        }
+
+        if (cell.Length > 0 || row.Count > 0)
+        {
+            row.Add(cell.ToString());
+            if (row.Any(value => value.Length > 0))
+            {
+                rows.Add(row);
+            }
+        }
+
+        return rows;
+    }
+
+    private static int FindCsvHeaderRow(IReadOnlyList<List<string>> records, IReadOnlyList<string> propertyNames)
+    {
+        for (var i = 0; i < records.Count; i++)
+        {
+            var headers = records[i].Select(NormalizeCsvHeader).ToList();
+            if (FindCsvColumn(headers, "SW材料", "SW-Material") >= 0
+                || FindCsvColumn(headers, "数量", "QTY", "QTY.", "Quantity") >= 0
+                || propertyNames.Any(name => FindCsvColumn(headers, name) >= 0))
+            {
+                return i;
+            }
+        }
+
+        return 0;
+    }
+
+    private static int FindCsvColumn(IReadOnlyList<string> headers, params string[] candidates)
+    {
+        for (var i = 0; i < headers.Count; i++)
+        {
+            foreach (var candidate in candidates)
+            {
+                if (string.Equals(headers[i], NormalizeCsvHeader(candidate), StringComparison.OrdinalIgnoreCase))
+                {
+                    return i;
+                }
+            }
+        }
+
+        for (var i = 0; i < headers.Count; i++)
+        {
+            foreach (var candidate in candidates)
+            {
+                var normalized = NormalizeCsvHeader(candidate);
+                if (!string.IsNullOrWhiteSpace(normalized)
+                    && headers[i].IndexOf(normalized, StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    return i;
+                }
+            }
+        }
+
+        return -1;
+    }
+
+    private static string NormalizeCsvHeader(string? value)
+    {
+        return (value ?? string.Empty).Trim().Trim('"').Replace("\r", " ").Replace("\n", " ");
+    }
+
+    private static string GetCsvCell(IReadOnlyList<string> row, int index)
+    {
+        return index >= 0 && index < row.Count ? row[index].Trim() : string.Empty;
+    }
+
+    private static string PickCsvDisplayName(
+        IReadOnlyList<string> record,
+        IReadOnlyList<string> headers,
+        int quantityIndex,
+        int materialIndex,
+        IEnumerable<int> propertyIndexes)
+    {
+        var excluded = new HashSet<int>(propertyIndexes.Where(index => index >= 0)) { quantityIndex, materialIndex };
+        for (var i = 0; i < record.Count; i++)
+        {
+            if (excluded.Contains(i))
+            {
+                continue;
+            }
+
+            var header = i < headers.Count ? headers[i] : string.Empty;
+            if (header.Contains("项目", StringComparison.OrdinalIgnoreCase)
+                || header.Equals("ITEM NO.", StringComparison.OrdinalIgnoreCase)
+                || header.Equals("ITEM", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            if (!string.IsNullOrWhiteSpace(record[i]))
+            {
+                return record[i].Trim();
+            }
+        }
+
+        return record.FirstOrDefault(value => !string.IsNullOrWhiteSpace(value))?.Trim() ?? string.Empty;
+    }
+
+    private static int ParseCsvQuantity(string value)
+    {
+        if (int.TryParse(value, NumberStyles.Integer, CultureInfo.CurrentCulture, out var quantity))
+        {
+            return quantity;
+        }
+
+        return double.TryParse(value, NumberStyles.Float, CultureInfo.CurrentCulture, out var numeric)
+            ? Math.Max(0, (int)Math.Round(numeric))
+            : 0;
+    }
+
+    private static string NormalizeCsvFileName(string rawFileName, string fullPath)
+    {
+        if (!string.IsNullOrWhiteSpace(fullPath))
+        {
+            return Path.GetFileNameWithoutExtension(fullPath);
+        }
+
+        return Path.GetFileNameWithoutExtension(rawFileName);
+    }
+
+    private static string InferDocumentType(string fullPath, string fileName)
+    {
+        var extension = Path.GetExtension(!string.IsNullOrWhiteSpace(fullPath) ? fullPath : fileName);
+        if (extension.Equals(".sldasm", StringComparison.OrdinalIgnoreCase)) return "装配体";
+        if (extension.Equals(".sldprt", StringComparison.OrdinalIgnoreCase)) return "零件";
+        return string.Empty;
+    }
+
+    private static string GetMaterialDisplay(string? documentType, string? material)
+    {
+        if (!string.IsNullOrWhiteSpace(material))
+        {
+            return material;
+        }
+
+        return string.Equals(documentType, "装配体", StringComparison.OrdinalIgnoreCase) ? "无需设置" : "未设置";
+    }
+
+    private static async Task<T> PostCommandAsync<T>(object request, TimeSpan timeout, Action<string>? log = null)
+    {
+        var serializeWatch = Stopwatch.StartNew();
+        var json = JsonSerializer.Serialize(request, JsonOptions);
+        log?.Invoke($"Add-in计时: 请求序列化 {serializeWatch.ElapsedMilliseconds}ms, bytes={Encoding.UTF8.GetByteCount(json)}");
+        using var content = new StringContent(json, Encoding.UTF8, "application/json");
+        using var cts = new CancellationTokenSource(timeout);
+        var postWatch = Stopwatch.StartNew();
+        using var response = await Client.PostAsync(new Uri(BaseUri, "command"), content, cts.Token);
+        log?.Invoke($"Add-in计时: HTTP等待响应头 {postWatch.ElapsedMilliseconds}ms");
+        var readBodyWatch = Stopwatch.StartNew();
+        var body = await response.Content.ReadAsStringAsync();
+        log?.Invoke($"Add-in计时: 读取响应正文 {readBodyWatch.ElapsedMilliseconds}ms, chars={body.Length}");
+        if (!response.IsSuccessStatusCode)
+        {
+            throw new InvalidOperationException($"Add-in请求失败: {response.StatusCode} {body}");
+        }
+
+        var deserializeWatch = Stopwatch.StartNew();
+        var envelope = JsonSerializer.Deserialize<AddinEnvelope<T>>(body, JsonOptions)
+                       ?? throw new InvalidOperationException("Add-in返回空响应");
+        log?.Invoke($"Add-in计时: JSON反序列化 {deserializeWatch.ElapsedMilliseconds}ms");
+        if (!envelope.Ok)
+        {
+            throw new InvalidOperationException(envelope.Error ?? "Add-in返回失败");
+        }
+
+        return envelope.Data!;
+    }
+
+    private static string GetDocumentIconPathFromLabel(string? label)
+    {
+        return label switch
+        {
+            "装配体" => "pack://application:,,,/Assets/assembly.png",
+            "零件" => "pack://application:,,,/Assets/part.png",
+            _ => string.Empty
+        };
+    }
+
+    private static string GetDrawingStatus(string? status, string? path)
+    {
+        if (!string.IsNullOrWhiteSpace(status))
+        {
+            return status;
+        }
+
+        return SolidWorksReader.HasSiblingDrawing(path ?? string.Empty) ? "有工程图" : "无工程图";
+    }
+
+    private static bool HasDrawing(string? status, string? path)
+    {
+        if (!string.IsNullOrWhiteSpace(status))
+        {
+            return status.Contains("有", StringComparison.OrdinalIgnoreCase);
+        }
+
+        return SolidWorksReader.HasSiblingDrawing(path ?? string.Empty);
+    }
+
+    private sealed class AddinEnvelope<T>
+    {
+        public bool Ok { get; set; }
+        public T? Data { get; set; }
+        public string? Error { get; set; }
+    }
+
+    private sealed class ReadBomResponse
+    {
+        public List<AddinBomRow>? Rows { get; set; }
+        public AddinBomTable? Table { get; set; }
+        public AddinBomCsvTable? TableCsv { get; set; }
+    }
+
+    private sealed class AddinBomTable
+    {
+        public List<string>? PropertyNames { get; set; }
+        public List<AddinBomRow>? Rows { get; set; }
+    }
+
+    private sealed class AddinBomCsvTable
+    {
+        public string? CsvText { get; set; }
+        public string? Separator { get; set; }
+        public List<string>? PropertyNames { get; set; }
+        public string? MainPath { get; set; }
+        public string? MainConfiguration { get; set; }
+        public int RowCount { get; set; }
+    }
+
+    private sealed class AddinBomRow
+    {
+        public string? DocumentType { get; set; }
+        public string? DrawingStatus { get; set; }
+        public string? FileName { get; set; }
+        public string? Configuration { get; set; }
+        public int Quantity { get; set; }
+        public string? Material { get; set; }
+        public string? FullPath { get; set; }
+        public Dictionary<string, string>? Properties { get; set; }
+        public List<string>? AvailablePropertyNames { get; set; }
     }
 }
 
@@ -2300,9 +3765,377 @@ internal static class SolidWorksReader
         return new SaveResult(changedRows.Count, savedRows, failedRows, savedProperties);
     }
 
+    public static BlankSizeResult CalculateBlankSizes(
+        dynamic swApp,
+        IReadOnlyList<BomRow> rows,
+        string propertyName,
+        Action<ReadProgress>? progress = null)
+    {
+        var updatedRows = 0;
+        var failedRows = 0;
+        var total = Math.Max(rows.Count, 1);
+        if (rows.Count == 0)
+        {
+            progress?.Invoke(new ReadProgress("没有需要计算下料尺寸的项目", 1, 1));
+            return new BlankSizeResult(0, 0, 0);
+        }
+
+        for (var i = 0; i < rows.Count; i++)
+        {
+            var row = rows[i];
+            var displayName = string.IsNullOrWhiteSpace(row.FileName) ? row.FullPath : row.FileName;
+            progress?.Invoke(new ReadProgress($"计算下料尺寸: {displayName}", i, total));
+
+            try
+            {
+                if (string.IsNullOrWhiteSpace(row.FullPath))
+                {
+                    throw new InvalidOperationException("缺少完整路径");
+                }
+
+                var model = TryOpenModel(swApp, row.FullPath);
+                if (model is null)
+                {
+                    throw new InvalidOperationException($"无法打开模型: {row.FullPath}");
+                }
+
+                ActivateConfigurationSafe(model, row.Configuration);
+                var blankSize = CalculateBlankSize(model, row.FullPath);
+                if (string.IsNullOrWhiteSpace(blankSize))
+                {
+                    throw new InvalidOperationException("无法获取包围盒");
+                }
+
+                row.SetProperty(propertyName, blankSize);
+                updatedRows++;
+            }
+            catch (Exception ex)
+            {
+                failedRows++;
+                progress?.Invoke(new ReadProgress($"下料尺寸计算失败: {displayName} - {ex.Message}", i + 1, total));
+                continue;
+            }
+
+            progress?.Invoke(new ReadProgress($"计算下料尺寸: {displayName}", i + 1, total));
+        }
+
+        return new BlankSizeResult(rows.Count, updatedRows, failedRows);
+    }
+
+    public static RelocateResult CopyExternalFilesToMainAssemblyDirectory(
+        dynamic swApp,
+        BomRow mainAssemblyRow,
+        IReadOnlyList<BomRow> rows,
+        Action<ReadProgress>? progress = null)
+    {
+        if (rows.Count == 0)
+        {
+            progress?.Invoke(new ReadProgress("没有需要复制重装的文件", 1, 1));
+            return new RelocateResult(0, 0, 0, 0);
+        }
+
+        var mainDirectory = Path.GetDirectoryName(Path.GetFullPath(mainAssemblyRow.FullPath));
+        if (string.IsNullOrWhiteSpace(mainDirectory))
+        {
+            throw new InvalidOperationException("无法获取主装配体目录");
+        }
+
+        dynamic? activeDoc = GetActiveDocSafe(swApp) ?? GetFirstOpenDocumentSafe(swApp);
+        if (activeDoc is null)
+        {
+            throw new InvalidOperationException("SolidWorks 当前没有打开装配体");
+        }
+
+        var assemblyPath = NormalizePathForCompare(GetModelPathSafe(activeDoc));
+        if (!string.Equals(assemblyPath, NormalizePathForCompare(mainAssemblyRow.FullPath), StringComparison.OrdinalIgnoreCase))
+        {
+            activeDoc = TryOpenModel(swApp, mainAssemblyRow.FullPath) ?? activeDoc;
+        }
+
+        object assemblyDoc = TryAsStrongAssemblyDoc(activeDoc, out SldWorks.IAssemblyDoc typedAssembly)
+            ? typedAssembly
+            : activeDoc;
+        Array? components = GetAssemblyComponentsSafe(assemblyDoc, false);
+        if (components is null || components.Length == 0)
+        {
+            throw new InvalidOperationException("无法从当前装配体获取组件列表");
+        }
+
+        Dictionary<string, List<object>> componentMap = BuildComponentPathMap(components);
+        var copiedFiles = 0;
+        var reloadedRows = 0;
+        var failedRows = 0;
+        var total = Math.Max(rows.Count, 1);
+
+        for (var i = 0; i < rows.Count; i++)
+        {
+            var row = rows[i];
+            var displayName = string.IsNullOrWhiteSpace(row.FileName) ? row.FullPath : row.FileName;
+            progress?.Invoke(new ReadProgress($"复制重装: {displayName}", i, total));
+
+            try
+            {
+                var sourcePath = Path.GetFullPath(row.FullPath);
+                if (!File.Exists(sourcePath))
+                {
+                    throw new FileNotFoundException("源文件不存在", sourcePath);
+                }
+
+                var targetPath = ResolveValidatedCopyTarget(sourcePath, mainDirectory);
+                if (!File.Exists(targetPath) || !FilesAreSame(sourcePath, targetPath))
+                {
+                    File.Copy(sourcePath, targetPath, overwrite: false);
+                    copiedFiles++;
+                }
+
+                var normalizedSource = NormalizePathForCompare(sourcePath);
+                if (!componentMap.TryGetValue(normalizedSource, out List<object>? matchingComponents) || matchingComponents.Count == 0)
+                {
+                    throw new InvalidOperationException($"装配体中没有找到引用: {sourcePath}");
+                }
+
+                var replacedCount = 0;
+                foreach (var component in matchingComponents)
+                {
+                    if (ReplaceComponentReference(component, targetPath))
+                    {
+                        replacedCount++;
+                    }
+                }
+
+                if (replacedCount == 0)
+                {
+                    throw new InvalidOperationException("组件引用替换失败");
+                }
+
+                row.FullPath = targetPath;
+                row.IsOutsideMainAssemblyDirectory = false;
+                reloadedRows++;
+                progress?.Invoke(new ReadProgress($"复制重装: {displayName}", i + 1, total));
+            }
+            catch (Exception ex)
+            {
+                failedRows++;
+                progress?.Invoke(new ReadProgress($"复制重装失败: {displayName} - {ex.Message}", i + 1, total));
+            }
+        }
+
+        SaveModel(activeDoc);
+        return new RelocateResult(rows.Count, copiedFiles, reloadedRows, failedRows);
+    }
+
+    private static Dictionary<string, List<object>> BuildComponentPathMap(Array components)
+    {
+        var map = new Dictionary<string, List<object>>(StringComparer.OrdinalIgnoreCase);
+        foreach (var item in components)
+        {
+            if (item is null)
+            {
+                continue;
+            }
+
+            dynamic component = item;
+            var path = NormalizePathForCompare(GetPathSafe(component));
+            if (string.IsNullOrWhiteSpace(path))
+            {
+                continue;
+            }
+
+            if (!map.TryGetValue(path, out List<object>? list))
+            {
+                list = [];
+                map[path] = list;
+            }
+
+            list!.Add(component);
+        }
+
+        return map;
+    }
+
+    private static string ResolveValidatedCopyTarget(string sourcePath, string targetDirectory)
+    {
+        var fileName = Path.GetFileName(sourcePath);
+        var targetPath = Path.Combine(targetDirectory, fileName);
+        if (!File.Exists(targetPath))
+        {
+            return targetPath;
+        }
+
+        if (FilesAreSame(sourcePath, targetPath))
+        {
+            return targetPath;
+        }
+
+        var name = Path.GetFileNameWithoutExtension(fileName);
+        var extension = Path.GetExtension(fileName);
+        for (var i = 1; i < 10000; i++)
+        {
+            var candidate = Path.Combine(targetDirectory, $"{name}_{i}{extension}");
+            if (!File.Exists(candidate))
+            {
+                return candidate;
+            }
+
+            if (FilesAreSame(sourcePath, candidate))
+            {
+                return candidate;
+            }
+        }
+
+        throw new IOException($"无法生成不冲突的复制文件名: {fileName}");
+    }
+
+    private static bool FilesAreSame(string leftPath, string rightPath)
+    {
+        try
+        {
+            var left = new FileInfo(leftPath);
+            var right = new FileInfo(rightPath);
+            if (!left.Exists || !right.Exists || left.Length != right.Length)
+            {
+                return false;
+            }
+
+            using var leftStream = File.OpenRead(left.FullName);
+            using var rightStream = File.OpenRead(right.FullName);
+            var leftBuffer = new byte[1024 * 1024];
+            var rightBuffer = new byte[1024 * 1024];
+            while (true)
+            {
+                var leftRead = leftStream.Read(leftBuffer, 0, leftBuffer.Length);
+                var rightRead = rightStream.Read(rightBuffer, 0, rightBuffer.Length);
+                if (leftRead != rightRead)
+                {
+                    return false;
+                }
+
+                if (leftRead == 0)
+                {
+                    return true;
+                }
+
+                for (var i = 0; i < leftRead; i++)
+                {
+                    if (leftBuffer[i] != rightBuffer[i])
+                    {
+                        return false;
+                    }
+                }
+            }
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static bool ReplaceComponentReference(dynamic component, string targetPath)
+    {
+        try
+        {
+            var result = Convert.ToInt32(component.ReplaceReference(targetPath), CultureInfo.InvariantCulture);
+            if (result >= 0)
+            {
+                return true;
+            }
+        }
+        catch { }
+
+        try
+        {
+            component.ReplaceReference(targetPath);
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
     private static string NormalizeConfigName(string configName)
     {
         return configName.Equals("Default", StringComparison.OrdinalIgnoreCase) ? string.Empty : configName;
+    }
+
+    private static void ActivateConfigurationSafe(dynamic model, string configName)
+    {
+        if (string.IsNullOrWhiteSpace(configName) || configName.Equals("Default", StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
+        try
+        {
+            model.ShowConfiguration2(configName);
+        }
+        catch
+        {
+            // Keep current configuration if the referenced one cannot be activated.
+        }
+    }
+
+    private static string CalculateBlankSize(dynamic model, string path)
+    {
+        var documentType = GetDocumentTypeSafe(path);
+        object? corners = null;
+        if (documentType == 1)
+        {
+            if (TryAsStrongPartDoc(model, out SldWorks.IPartDoc partDoc))
+            {
+                try { corners = partDoc.GetPartBox(true); } catch { }
+            }
+
+            if (corners is null)
+            {
+                try { corners = model.GetPartBox(true); } catch { }
+            }
+        }
+        else if (documentType == 2)
+        {
+            if (TryAsStrongAssemblyDoc(model, out SldWorks.IAssemblyDoc assemblyDoc))
+            {
+                try { corners = assemblyDoc.GetBox(1); } catch { }
+            }
+
+            if (corners is null)
+            {
+                try { corners = model.GetBox(1); } catch { }
+            }
+        }
+
+        var values = ToDoubleList(corners);
+        if (values.Count < 6)
+        {
+            return string.Empty;
+        }
+
+        var sizes = new[]
+        {
+            Math.Round(Math.Abs(values[3] - values[0]) * 1000, 1),
+            Math.Round(Math.Abs(values[4] - values[1]) * 1000, 1),
+            Math.Round(Math.Abs(values[5] - values[2]) * 1000, 1)
+        };
+        Array.Sort(sizes);
+        return string.Join("x", sizes.Reverse().Select(x => x.ToString("0.#", CultureInfo.InvariantCulture)));
+    }
+
+    private static List<double> ToDoubleList(object? value)
+    {
+        if (value is null)
+        {
+            return [];
+        }
+
+        if (value is IEnumerable enumerable)
+        {
+            return enumerable
+                .Cast<object?>()
+                .Select(item => Convert.ToDouble(item, CultureInfo.InvariantCulture))
+                .ToList();
+        }
+
+        return [];
     }
 
     private static void ReadAssembly(dynamic assemblyDoc, Dictionary<string, BomRow> map, ReadOptions options, dynamic swApp, PropertyMappingConfig mapping, Action<ReadProgress>? progress)
@@ -2323,6 +4156,7 @@ internal static class SolidWorksReader
         public int Quantity { get; set; }
         public dynamic? Component { get; init; }
         public dynamic? Model { get; set; }
+        public BomRow? Row { get; set; }
     }
 
     private static void ReadBomFromAssemblyComponents(
@@ -2367,18 +4201,32 @@ internal static class SolidWorksReader
                 }
                 else
                 {
+                    var model = GetModelDocSafe(component);
+                    BomRow? row = null;
+                    if (model is not null)
+                    {
+                        row = ReadFromModel(model, config, path, options.PropertySourceMode, mapping);
+                        row.Quantity = 0;
+                        map[key] = row;
+                    }
+
                     seed = new BomSeed
                     {
                         Path = path,
                         Config = config,
                         Quantity = 0,
                         Component = component,
-                        Model = GetModelDocSafe(component)
+                        Model = model,
+                        Row = row
                     };
                     seeds[key] = seed;
                 }
 
                 seed!.Quantity++;
+                if (seed.Row is not null)
+                {
+                    seed.Row.Quantity++;
+                }
             }
             catch
             {
@@ -2388,9 +4236,19 @@ internal static class SolidWorksReader
 
         var total = seeds.Count;
         progress?.Invoke(new ReadProgress("统计BOM项目", total, Math.Max(total, 1)));
-        var done = 0;
+        var done = seeds.Values.Count(seed => seed.Row is not null);
+        if (done > 0)
+        {
+            progress?.Invoke(new ReadProgress($"已从BOM组件直接读取属性: {done} 项", done, Math.Max(total, 1)));
+        }
+
         foreach (var seed in seeds.Values)
         {
+            if (seed.Row is not null)
+            {
+                continue;
+            }
+
             var model = seed.Model ?? TryOpenModel(swApp, seed.Path);
             if (model == null)
             {
@@ -2713,7 +4571,6 @@ internal static class SolidWorksReader
         var customManager = GetCustomPropertyManagerSafe(model, "");
         var preferConfig = sourceMode == PropertySourceMode.CurrentConfiguration;
         var fileName = Path.GetFileNameWithoutExtension(path);
-        var hasDrawing = HasSiblingDrawing(path);
         var documentType = GetDocumentTypeSafe(path);
         var cfgProps = cfgManager is null ? new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase) : ReadAllProperties(cfgManager);
         var customProps = customManager is null ? new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase) : ReadAllProperties(customManager);
@@ -2737,8 +4594,8 @@ internal static class SolidWorksReader
         {
             DocumentType = GetDocumentTypeLabel(path),
             DocumentIconPath = GetDocumentIconPath(path),
-            DrawingStatus = hasDrawing ? "有工程图" : "无工程图",
-            DrawingIconPath = hasDrawing ? "pack://application:,,,/Assets/drawing.png" : string.Empty,
+            DrawingStatus = string.Empty,
+            DrawingIconPath = string.Empty,
             FileName = fileName,
             Configuration = string.IsNullOrWhiteSpace(configName) ? "Default" : configName,
             Material = material,
@@ -2813,7 +4670,7 @@ internal static class SolidWorksReader
     {
         if (TryAsStrongPartDoc(model, out SldWorks.IPartDoc partDoc))
         {
-            foreach (var config in GetMaterialConfigCandidates(configName))
+            foreach (var config in GetMaterialConfigCandidates(model, configName))
             {
                 try
                 {
@@ -2847,7 +4704,7 @@ internal static class SolidWorksReader
             catch { }
         }
 
-        foreach (var config in GetMaterialConfigCandidates(configName))
+        foreach (var config in GetMaterialConfigCandidates(model, configName))
         {
             try
             {
@@ -2889,15 +4746,43 @@ internal static class SolidWorksReader
         }
     }
 
-    private static IEnumerable<string> GetMaterialConfigCandidates(string configName)
+    private static bool TryAsStrongAssemblyDoc(dynamic model, out SldWorks.IAssemblyDoc assemblyDoc)
     {
-        if (!string.IsNullOrWhiteSpace(configName) && !configName.Equals("Default", StringComparison.OrdinalIgnoreCase))
+        try
         {
-            yield return configName;
+            assemblyDoc = (SldWorks.IAssemblyDoc)model;
+            return assemblyDoc != null;
+        }
+        catch
+        {
+            assemblyDoc = null!;
+            return false;
+        }
+    }
+
+    private static IEnumerable<string> GetMaterialConfigCandidates(dynamic model, string configName)
+    {
+        var candidates = new List<string>();
+        AddMaterialConfigCandidate(candidates, configName);
+        try
+        {
+            AddMaterialConfigCandidate(candidates, Convert.ToString(model.ConfigurationManager.ActiveConfiguration.Name, CultureInfo.InvariantCulture));
+        }
+        catch { }
+        AddMaterialConfigCandidate(candidates, string.Empty);
+        AddMaterialConfigCandidate(candidates, "Default");
+        return candidates;
+    }
+
+    private static void AddMaterialConfigCandidate(ICollection<string> candidates, string? configName)
+    {
+        var candidate = string.IsNullOrWhiteSpace(configName) ? string.Empty : configName.Trim();
+        if (candidates.Any(x => string.Equals(x, candidate, StringComparison.OrdinalIgnoreCase)))
+        {
+            return;
         }
 
-        yield return string.Empty;
-        yield return "Default";
+        candidates.Add(candidate);
     }
 
     private static bool IsSolidWorksMaterialExpression(string value)
@@ -2968,6 +4853,9 @@ internal static class SolidWorksReader
 
         if (TryAsStrongCustomPropertyManager(managerObj, out SldWorks.ICustomPropertyManager typedManager))
         {
+            if (TryReadAllStrongByGetAll3(typedManager, result)) return result;
+            if (TryReadAllStrongByGetAll2(typedManager, result)) return result;
+
             foreach (var name in GetPropertyNamesStrong(typedManager))
             {
                 var value = ReadPropertyStrong(typedManager, name);
@@ -2981,10 +4869,10 @@ internal static class SolidWorksReader
             {
                 return result;
             }
-
-            if (TryReadAllStrongByGetAll3(typedManager, result)) return result;
-            if (TryReadAllStrongByGetAll2(typedManager, result)) return result;
         }
+
+        if (TryReadAllByGetAll3(managerObj, result)) return result;
+        if (TryReadAllByGetAll2(managerObj, result)) return result;
 
         foreach (var name in GetPropertyNames(managerObj))
         {
@@ -2999,9 +4887,6 @@ internal static class SolidWorksReader
             return result;
         }
 
-        if (TryReadAllByGetAll3(managerObj, result)) return result;
-        if (TryReadAllByGetAll2(managerObj, result)) return result;
-
         return result;
     }
 
@@ -3015,7 +4900,7 @@ internal static class SolidWorksReader
             object resolvedObj = null!;
             object linkedObj = null!;
             manager.GetAll3(ref namesObj, ref typesObj, ref valuesObj, ref resolvedObj, ref linkedObj);
-            AddPropertyList(result, namesObj, valuesObj, resolvedObj);
+            AddPropertyList(result, namesObj, valuesObj);
             return result.Count > 0;
         }
         catch
@@ -3033,7 +4918,7 @@ internal static class SolidWorksReader
             object valuesObj = null!;
             object resolvedObj = null!;
             manager.GetAll2(ref namesObj, ref typesObj, ref valuesObj, ref resolvedObj);
-            AddPropertyList(result, namesObj, valuesObj, resolvedObj);
+            AddPropertyList(result, namesObj, valuesObj);
             return result.Count > 0;
         }
         catch
@@ -3042,17 +4927,15 @@ internal static class SolidWorksReader
         }
     }
 
-    private static void AddPropertyList(Dictionary<string, string> result, object? namesObj, object? valuesObj, object? resolvedObj)
+    private static void AddPropertyList(Dictionary<string, string> result, object? namesObj, object? valuesObj)
     {
-        var names = ToStringList(namesObj);
-        var values = ToStringList(valuesObj);
-        var resolved = ToStringList(resolvedObj);
+        var names = ToIndexedStringList(namesObj);
+        var values = ToIndexedStringList(valuesObj);
         for (var i = 0; i < names.Count; i++)
         {
             var key = names[i];
             if (string.IsNullOrWhiteSpace(key)) continue;
-            var value = i < resolved.Count && !string.IsNullOrWhiteSpace(resolved[i]) ? resolved[i] :
-                i < values.Count ? values[i] : string.Empty;
+            var value = i < values.Count ? values[i] : string.Empty;
             value = NormalizeValue(value);
             if (!string.IsNullOrWhiteSpace(value))
             {
@@ -3086,22 +4969,8 @@ internal static class SolidWorksReader
             return false;
         }
 
-        // GetAll3(out names, out types, out values, out resolvedValues, out linkToProperty)
-        var names = ToStringList(args[0]);
-        var values = ToStringList(args[2]);
-        var resolved = ToStringList(args[3]);
-        for (var i = 0; i < names.Count; i++)
-        {
-            var key = names[i];
-            if (string.IsNullOrWhiteSpace(key)) continue;
-            var value = i < resolved.Count && !string.IsNullOrWhiteSpace(resolved[i]) ? resolved[i] :
-                        i < values.Count ? values[i] : string.Empty;
-            value = NormalizeValue(value);
-            if (!string.IsNullOrWhiteSpace(value))
-            {
-                result[key] = value;
-            }
-        }
+        // GetAll3(out names, out types, out values, out evaluationStatuses, out linkToProperty)
+        AddPropertyList(result, args[0], args[2]);
 
         return result.Count > 0;
     }
@@ -3114,22 +4983,8 @@ internal static class SolidWorksReader
             return false;
         }
 
-        // GetAll2(out names, out types, out values, out resolvedValues)
-        var names = ToStringList(args[0]);
-        var values = ToStringList(args[2]);
-        var resolved = ToStringList(args[3]);
-        for (var i = 0; i < names.Count; i++)
-        {
-            var key = names[i];
-            if (string.IsNullOrWhiteSpace(key)) continue;
-            var value = i < resolved.Count && !string.IsNullOrWhiteSpace(resolved[i]) ? resolved[i] :
-                i < values.Count ? values[i] : string.Empty;
-            value = NormalizeValue(value);
-            if (!string.IsNullOrWhiteSpace(value))
-            {
-                result[key] = value;
-            }
-        }
+        // GetAll2(out names, out types, out values, out evaluationStatuses)
+        AddPropertyList(result, args[0], args[2]);
 
         return result.Count > 0;
     }
@@ -3169,6 +5024,27 @@ internal static class SolidWorksReader
             {
                 var str = item?.ToString();
                 if (!string.IsNullOrWhiteSpace(str)) list.Add(str);
+            }
+        }
+
+        return list;
+    }
+
+    private static List<string> ToIndexedStringList(object? value)
+    {
+        var list = new List<string>();
+        if (value is null) return list;
+        if (value is string s)
+        {
+            list.Add(s);
+            return list;
+        }
+
+        if (value is IEnumerable enumerable)
+        {
+            foreach (var item in enumerable)
+            {
+                list.Add(item?.ToString() ?? string.Empty);
             }
         }
 
@@ -3604,7 +5480,7 @@ internal static class SolidWorksReader
         };
     }
 
-    private static bool HasSiblingDrawing(string modelPath)
+    internal static bool HasSiblingDrawing(string modelPath)
     {
         if (string.IsNullOrWhiteSpace(modelPath))
         {
@@ -3626,14 +5502,13 @@ internal static class SolidWorksReader
                 return false;
             }
 
-            var drawingPath = Path.Combine(directory, fileName + ".SLDDRW");
-            if (File.Exists(drawingPath))
+            if (!Directory.Exists(directory))
             {
-                return true;
+                return false;
             }
 
-            drawingPath = Path.Combine(directory, fileName + ".slddrw");
-            return File.Exists(drawingPath);
+            return Directory.EnumerateFiles(directory, "*.slddrw")
+                .Any(file => string.Equals(Path.GetFileNameWithoutExtension(file), fileName, StringComparison.OrdinalIgnoreCase));
         }
         catch
         {
