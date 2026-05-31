@@ -17,6 +17,10 @@
     </ItemGroup>
 
     <ItemGroup>
+        <PackageReference Include="System.Text.Encoding.CodePages" Version="9.0.0" />
+    </ItemGroup>
+
+    <ItemGroup>
         <Resource Include="Assets\part.png" />
         <Resource Include="Assets\assembly.png" />
         <Resource Include="Assets\drawing.png" />

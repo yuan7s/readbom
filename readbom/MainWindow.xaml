@@ -169,6 +169,9 @@
                     <MenuItem Header="填充列" Click="FillColumnButton_OnClick"/>
                     <MenuItem Header="查找替换" Click="FindReplaceButton_OnClick"/>
                     <Separator/>
+                    <MenuItem Header="打开零件/装配体" Click="OpenModelMenuItem_OnClick"/>
+                    <MenuItem Header="打开工程图" Click="OpenDrawingMenuItem_OnClick"/>
+                    <Separator/>
                     <MenuItem Header="保存到 SW" Click="SaveToSwButton_OnClick"/>
                 </ContextMenu>
             </DataGrid.ContextMenu>

@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Net;
+using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
@@ -139,6 +140,14 @@ internal sealed class AddinHttpServer : IDisposable
                 return ListProperties(request);
             case "read-bom":
                 return ReadBom(request);
+            case "open-document":
+                return OpenDocument(request);
+            case "related-files":
+                return GetRelatedFiles(request);
+            case "save-properties-batch":
+                return SavePropertiesBatch(request);
+            case "calculate-blank-size":
+                return CalculateBlankSizeBatch(request);
             case "set-property":
                 return SetProperty(request);
             case "rebuild":
@@ -189,6 +198,166 @@ internal sealed class AddinHttpServer : IDisposable
         return new { name = request.Name, value = request.Value ?? string.Empty, configuration = configName };
     }
 
+    private object SavePropertiesBatch(CommandRequest request)
+    {
+        var rows = request.SaveRows ?? new SavePropertyRow[0];
+        var savedRows = 0;
+        var failedRows = 0;
+        var savedProperties = 0;
+        var failures = new List<object>();
+        var useConfiguration = string.Equals(request.PropertySourceMode, "CurrentConfiguration", StringComparison.OrdinalIgnoreCase);
+        AddinLog.Write($"SavePropertiesBatch: rows={rows.Length}, sourceMode={request.PropertySourceMode}");
+
+        for (var i = 0; i < rows.Length; i++)
+        {
+            var row = rows[i];
+            var displayName = string.IsNullOrWhiteSpace(row.DisplayName) ? row.Path : row.DisplayName;
+            try
+            {
+                if (string.IsNullOrWhiteSpace(row.Path))
+                {
+                    throw new InvalidOperationException("缺少完整路径");
+                }
+
+                var path = System.IO.Path.GetFullPath(row.Path.Trim());
+                var docType = GetDocumentTypeFromPath(path);
+                if (docType == 0)
+                {
+                    throw new InvalidOperationException("不支持的 SolidWorks 文件类型");
+                }
+
+                if (!File.Exists(path))
+                {
+                    throw new InvalidOperationException("文件不存在");
+                }
+
+                var model = TryGetOpenModelByPath(path);
+                if (model == null)
+                {
+                    var errors = 0;
+                    var warnings = 0;
+                    try { _swApp.DocumentVisible(true, docType); } catch { }
+                    model = _swApp.OpenDoc6(path, docType, (int)swOpenDocOptions_e.swOpenDocOptions_Silent, string.Empty, ref errors, ref warnings) as ModelDoc2;
+                    AddinLog.Write($"SavePropertiesBatch OpenDoc6: {displayName}, model={(model != null)}, errors={errors}, warnings={warnings}");
+                    if (model == null)
+                    {
+                        throw new InvalidOperationException($"无法打开模型，错误码={errors}，警告码={warnings}");
+                    }
+                }
+
+                var configName = useConfiguration ? NormalizeConfigurationName(row.Configuration) : string.Empty;
+                var manager = model.Extension.get_CustomPropertyManager(configName);
+                if (manager == null)
+                {
+                    throw new InvalidOperationException(useConfiguration
+                        ? "无法获取配置属性管理器: " + configName
+                        : "无法获取自定义属性管理器");
+                }
+
+                var changes = row.Changes ?? new SavePropertyChange[0];
+                foreach (var change in changes)
+                {
+                    WriteProperty(manager, change.Name, change.Value ?? string.Empty);
+                    savedProperties++;
+                }
+
+                SaveModel(model);
+                savedRows++;
+                AddinLog.Write($"SavePropertiesBatch row ok: {displayName}, changes={changes.Length}, index={i + 1}/{rows.Length}");
+            }
+            catch (Exception ex)
+            {
+                failedRows++;
+                failures.Add(new { displayName, path = row?.Path, error = ex.Message });
+                AddinLog.Write($"SavePropertiesBatch row failed: {displayName}, index={i + 1}/{rows.Length}: {ex}");
+            }
+        }
+
+        AddinLog.Write($"SavePropertiesBatch done: savedRows={savedRows}, failedRows={failedRows}, savedProperties={savedProperties}");
+        return new
+        {
+            totalRows = rows.Length,
+            savedRows,
+            failedRows,
+            savedProperties,
+            failures
+        };
+    }
+
+    private object CalculateBlankSizeBatch(CommandRequest request)
+    {
+        var rows = request.BlankRows ?? new BlankSizeRow[0];
+        var updatedRows = 0;
+        var failedRows = 0;
+        var results = new List<object>();
+        AddinLog.Write($"CalculateBlankSizeBatch: rows={rows.Length}");
+
+        for (var i = 0; i < rows.Length; i++)
+        {
+            var row = rows[i];
+            var displayName = string.IsNullOrWhiteSpace(row.DisplayName) ? row.Path : row.DisplayName;
+            try
+            {
+                if (string.IsNullOrWhiteSpace(row.Path))
+                {
+                    throw new InvalidOperationException("缺少完整路径");
+                }
+
+                var path = System.IO.Path.GetFullPath(row.Path.Trim());
+                var docType = GetDocumentTypeFromPath(path);
+                if (docType == 0)
+                {
+                    throw new InvalidOperationException("不支持的 SolidWorks 文件类型");
+                }
+
+                if (!File.Exists(path))
+                {
+                    throw new InvalidOperationException("文件不存在");
+                }
+
+                var model = TryGetOpenModelByPath(path);
+                if (model == null)
+                {
+                    var errors = 0;
+                    var warnings = 0;
+                    try { _swApp.DocumentVisible(true, docType); } catch { }
+                    model = _swApp.OpenDoc6(path, docType, (int)swOpenDocOptions_e.swOpenDocOptions_Silent, string.Empty, ref errors, ref warnings) as ModelDoc2;
+                    AddinLog.Write($"CalculateBlankSizeBatch OpenDoc6: {displayName}, model={(model != null)}, errors={errors}, warnings={warnings}");
+                    if (model == null)
+                    {
+                        throw new InvalidOperationException($"无法打开模型，错误码={errors}，警告码={warnings}");
+                    }
+                }
+
+                ActivateConfiguration(model, row.Configuration);
+                var box = GetModelBoxValues(model, path);
+                if (box.Count < 6)
+                {
+                    throw new InvalidOperationException("无法获取包围盒");
+                }
+
+                updatedRows++;
+                results.Add(new { path, displayName, box, success = true, error = string.Empty });
+                AddinLog.Write($"CalculateBlankSizeBatch row ok: {displayName}, box={string.Join(",", box)}, index={i + 1}/{rows.Length}");
+            }
+            catch (Exception ex)
+            {
+                failedRows++;
+                results.Add(new { path = row?.Path, displayName, box = new List<double>(), success = false, error = ex.Message });
+                AddinLog.Write($"CalculateBlankSizeBatch row failed: {displayName}, index={i + 1}/{rows.Length}: {ex}");
+            }
+        }
+
+        AddinLog.Write($"CalculateBlankSizeBatch done: updatedRows={updatedRows}, failedRows={failedRows}");
+        return new
+        {
+            totalRows = rows.Length,
+            updatedRows,
+            failedRows,
+            results
+        };
+    }
+
     private object ReadBom(CommandRequest request)
     {
         var totalWatch = Stopwatch.StartNew();
@@ -201,7 +370,7 @@ internal sealed class AddinHttpServer : IDisposable
         if (assembly != null)
         {
             var tableResult = ExportHiddenBomTableCsv(model, mainPath, mainConfig, request);
-            AddinLog.Write($"ReadBom: hidden BOM CSV path used, chars={tableResult.CsvText?.Length ?? 0}");
+            AddinLog.Write($"ReadBom: hidden BOM CSV path used, bytes={tableResult.CsvByteCount}");
             AddinLog.Write($"ReadBom: output CSV totalElapsed={totalWatch.ElapsedMilliseconds}ms");
             return new { tableCsv = tableResult };
         }
@@ -214,6 +383,127 @@ internal sealed class AddinHttpServer : IDisposable
 
         AddinLog.Write($"ReadBom: output rows={rows.Count}, totalElapsed={totalWatch.ElapsedMilliseconds}ms");
         return new { rows };
+    }
+
+    private object OpenDocument(CommandRequest request)
+    {
+        if (string.IsNullOrWhiteSpace(request.Path))
+        {
+            throw new InvalidOperationException("path 不能为空");
+        }
+
+        var path = System.IO.Path.GetFullPath(request.Path.Trim());
+        if (!File.Exists(path))
+        {
+            throw new InvalidOperationException("文件不存在: " + path);
+        }
+
+        var docType = GetDocumentTypeFromPath(path);
+        if (docType == 0)
+        {
+            throw new InvalidOperationException("不支持的 SolidWorks 文件类型: " + path);
+        }
+
+        AddinLog.Write($"OpenDocument queued: path={path}, docType={docType}");
+        ActivateSolidWorksWindow();
+        Task.Run(() => OpenDocumentInBackground(path, docType));
+        return new
+        {
+            path,
+            title = System.IO.Path.GetFileName(path),
+            accepted = true
+        };
+    }
+
+    private void OpenDocumentInBackground(string path, int docType)
+    {
+        var watch = Stopwatch.StartNew();
+        AddinLog.Write($"OpenDocument background start: path={path}, docType={docType}");
+        var model = TryGetOpenModelByPath(path);
+        var wasOpen = model != null;
+        var errors = 0;
+        var warnings = 0;
+        try
+        {
+            if (model == null)
+            {
+                try { _swApp.DocumentVisible(true, docType); } catch (Exception ex) { AddinLog.Write("OpenDocument DocumentVisible ignored: " + ex.Message); }
+                model = _swApp.OpenDoc6(path, docType, 0, string.Empty, ref errors, ref warnings) as ModelDoc2;
+                AddinLog.Write($"OpenDocument OpenDoc6 result: model={(model != null)}, errors={errors}, warnings={warnings}");
+            }
+
+            if (model == null)
+            {
+                AddinLog.Write($"OpenDocument failed: OpenDoc6 returned null, errors={errors}, warnings={warnings}, path={path}");
+                return;
+            }
+
+            var title = Safe(() => model.GetTitle()) ?? System.IO.Path.GetFileName(path);
+            ActivateDocument(title, path);
+            ActivateSolidWorksWindow();
+            AddinLog.Write($"OpenDocument background ok: title={title}, wasOpen={wasOpen}, errors={errors}, warnings={warnings}, elapsed={watch.ElapsedMilliseconds}ms");
+        }
+        catch (Exception ex)
+        {
+            AddinLog.Write($"OpenDocument background failed: path={path}, elapsed={watch.ElapsedMilliseconds}ms: {ex}");
+        }
+    }
+
+    private object GetRelatedFiles(CommandRequest request)
+    {
+        if (string.IsNullOrWhiteSpace(request.Path))
+        {
+            throw new InvalidOperationException("path 不能为空");
+        }
+
+        var mainPath = System.IO.Path.GetFullPath(request.Path.Trim());
+        var files = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        AddRelatedFile(files, mainPath);
+        AddinLog.Write("RelatedFiles: mainPath=" + mainPath);
+
+        object dependencies = null;
+        try
+        {
+            dependencies = _swApp.GetDocumentDependencies2(mainPath, true, true, true);
+        }
+        catch (Exception ex)
+        {
+            AddinLog.Write("RelatedFiles GetDocumentDependencies2 failed: " + ex.Message);
+        }
+
+        foreach (var item in ToIndexedStringList(dependencies))
+        {
+            AddRelatedFile(files, item);
+        }
+
+        AddinLog.Write("RelatedFiles: count=" + files.Count);
+        return new { mainPath, files = files.ToList() };
+    }
+
+    private static void AddRelatedFile(ISet<string> files, string value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return;
+        }
+
+        var candidate = value.Trim();
+        var extension = System.IO.Path.GetExtension(candidate);
+        if (!extension.Equals(".sldprt", StringComparison.OrdinalIgnoreCase)
+            && !extension.Equals(".sldasm", StringComparison.OrdinalIgnoreCase)
+            && !extension.Equals(".slddrw", StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
+        try
+        {
+            files.Add(System.IO.Path.GetFullPath(candidate));
+        }
+        catch
+        {
+            files.Add(candidate);
+        }
     }
 
     private BomTableCsvTransfer ExportHiddenBomTableCsv(
@@ -256,13 +546,14 @@ internal sealed class AddinHttpServer : IDisposable
             }
 
             var readCsvWatch = Stopwatch.StartNew();
-            var csvText = ReadTextFileWithEncodingDetection(csvPath);
-            AddinLog.Write($"ReadBom timing: read CSV file chars={csvText.Length}, elapsed={readCsvWatch.ElapsedMilliseconds}ms");
+            var csvBytes = File.ReadAllBytes(csvPath);
+            AddinLog.Write($"ReadBom timing: read CSV file bytes={csvBytes.Length}, elapsed={readCsvWatch.ElapsedMilliseconds}ms");
             TryDeleteFile(csvPath);
 
             return new BomTableCsvTransfer
             {
-                CsvText = csvText,
+                CsvBase64 = Convert.ToBase64String(csvBytes),
+                CsvByteCount = csvBytes.Length,
                 Separator = separator,
                 PropertyNames = propertyNames.ToList(),
                 MainPath = mainPath ?? string.Empty,
@@ -276,30 +567,6 @@ internal sealed class AddinHttpServer : IDisposable
             DeleteBomTableFeature(model, bomTable);
             AddinLog.Write($"ReadBom timing: delete hidden BOM elapsed={deleteWatch.ElapsedMilliseconds}ms");
         }
-    }
-
-    private BomTableTransferRow CreateMainBomTableRow(ModelDoc2 model, string path, string configName, string[] propertyNames)
-    {
-        var properties = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        try
-        {
-            var cfgManager = model.Extension.get_CustomPropertyManager(configName ?? string.Empty);
-            var customManager = model.Extension.get_CustomPropertyManager(string.Empty);
-            var cfgProps = ReadAllProperties(cfgManager);
-            var customProps = ReadAllProperties(customManager);
-            foreach (var name in propertyNames ?? Array.Empty<string>())
-            {
-                properties[name] = cfgProps.TryGetValue(name, out var cfgValue) && !string.IsNullOrWhiteSpace(cfgValue)
-                    ? cfgValue
-                    : customProps.TryGetValue(name, out var customValue) ? customValue : string.Empty;
-            }
-        }
-        catch (Exception ex)
-        {
-            AddinLog.Write($"ReadBom main row properties skipped: {ex.Message}");
-        }
-
-        return CreateBomTableRow(path, configName, 1, properties, "无需设置", propertyNames);
     }
 
     private static string[] GetDistinctPropertyNames(string[] propertyNames)
@@ -551,142 +818,6 @@ internal sealed class AddinHttpServer : IDisposable
         }
     }
 
-    private static Dictionary<string, int> FindBomPropertyColumns(TableAnnotation table, BomTableAnnotation bomTable, string[] propertyNames)
-    {
-        var result = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
-        foreach (var propertyName in propertyNames ?? Array.Empty<string>())
-        {
-            var columnIndex = FindBomColumnIndex(table, bomTable, propertyName, propertyName);
-            AddinLog.Write($"ReadBom timing: find TXT property column name={propertyName}, index={columnIndex}");
-            if (columnIndex < 0)
-            {
-                throw new InvalidOperationException($"专用 BOM 模板中没有找到属性列: {propertyName}");
-            }
-
-            result[propertyName] = columnIndex;
-        }
-
-        return result;
-    }
-
-    private static int FindBomColumnIndex(TableAnnotation table, BomTableAnnotation bomTable, string title, string customPropertyName)
-    {
-        var columnCount = table.ColumnCount;
-        for (var columnIndex = 0; columnIndex < columnCount; columnIndex++)
-        {
-            var columnCustomProperty = SafeColumnCustomProperty(bomTable, columnIndex);
-            var columnTitle = SafeColumnTitle(table, columnIndex);
-            if (ColumnMatches(columnCustomProperty, customPropertyName)
-                || ColumnMatches(columnCustomProperty, title)
-                || ColumnMatches(columnTitle, title)
-                || ColumnMatches(columnTitle, customPropertyName))
-            {
-                return columnIndex;
-            }
-        }
-
-        AddinLog.Write($"ReadBom column not found: title={title}, property={customPropertyName}, columnCount={columnCount}");
-        for (var columnIndex = 0; columnIndex < columnCount; columnIndex++)
-        {
-            AddinLog.Write($"ReadBom column dump: index={columnIndex}, title={SafeColumnTitle(table, columnIndex)}, customProperty={SafeColumnCustomProperty(bomTable, columnIndex)}");
-        }
-
-        return -1;
-    }
-
-    private static string SafeColumnCustomProperty(BomTableAnnotation bomTable, int columnIndex)
-    {
-        try { return bomTable.GetColumnCustomProperty(columnIndex)?.Trim() ?? string.Empty; }
-        catch { return string.Empty; }
-    }
-
-    private static string SafeColumnTitle(TableAnnotation table, int columnIndex)
-    {
-        try
-        {
-            var value = table.GetColumnTitle2(columnIndex, false);
-            if (!string.IsNullOrWhiteSpace(value))
-            {
-                return value.Trim();
-            }
-        }
-        catch { }
-
-        try
-        {
-            return table.GetColumnTitle2(columnIndex, true)?.Trim() ?? string.Empty;
-        }
-        catch
-        {
-            return string.Empty;
-        }
-    }
-
-    private static bool ColumnMatches(string actual, string expected)
-    {
-        if (string.IsNullOrWhiteSpace(actual) || string.IsNullOrWhiteSpace(expected))
-        {
-            return false;
-        }
-
-        var normalizedActual = actual.Trim().Trim('"');
-        var normalizedExpected = expected.Trim().Trim('"');
-        return string.Equals(normalizedActual, normalizedExpected, StringComparison.OrdinalIgnoreCase)
-               || normalizedActual.IndexOf("\"" + normalizedExpected + "\"", StringComparison.OrdinalIgnoreCase) >= 0;
-    }
-
-    private static Dictionary<string, string> ReadBomTableProperties(
-        TableAnnotation table,
-        int rowIndex,
-        IReadOnlyDictionary<string, int> propertyColumnIndexes)
-    {
-        var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        foreach (var item in propertyColumnIndexes)
-        {
-            result[item.Key] = GetTableCellText(table, rowIndex, item.Value);
-        }
-
-        return result;
-    }
-
-    private static string GetTableCellText(TableAnnotation table, int rowIndex, int columnIndex)
-    {
-        if (columnIndex < 0)
-        {
-            return string.Empty;
-        }
-
-        try
-        {
-            var value = table.get_DisplayedText2(rowIndex, columnIndex, false);
-            if (!string.IsNullOrWhiteSpace(value))
-            {
-                return value.Trim();
-            }
-        }
-        catch { }
-
-        try
-        {
-            var value = table.get_Text2(rowIndex, columnIndex, false);
-            if (!string.IsNullOrWhiteSpace(value))
-            {
-                return value.Trim();
-            }
-        }
-        catch { }
-
-        try
-        {
-            var value = table.get_Text(rowIndex, columnIndex);
-            return value?.Trim() ?? string.Empty;
-        }
-        catch
-        {
-            return string.Empty;
-        }
-    }
-
     private List<object> ReadRowsFromComponents(AssemblyDoc assembly, CommandRequest request, DrawingLookup drawingLookup)
     {
         var stepWatch = Stopwatch.StartNew();
@@ -860,51 +991,6 @@ internal sealed class AddinHttpServer : IDisposable
             fullPath = path ?? string.Empty,
             properties,
             availablePropertyNames = available.Distinct(StringComparer.OrdinalIgnoreCase).OrderBy(x => x).ToList()
-        };
-    }
-
-    private BomTableTransferRow CreateBomTableRow(
-        string path,
-        string configName,
-        int quantity,
-        Dictionary<string, string> properties,
-        string material,
-        string[] propertyNames)
-    {
-        var documentType = GetDocumentTypeLabel(path);
-        if (documentType == "零件" && string.IsNullOrWhiteSpace(material))
-        {
-            material = "未设置";
-        }
-        else if (documentType != "零件")
-        {
-            material = "无需设置";
-        }
-
-        var available = (propertyNames ?? Array.Empty<string>())
-            .Where(name => !string.IsNullOrWhiteSpace(name))
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .OrderBy(x => x, StringComparer.OrdinalIgnoreCase)
-            .ToList();
-
-        foreach (var propertyName in propertyNames ?? Array.Empty<string>())
-        {
-            if (!properties.ContainsKey(propertyName))
-            {
-                properties[propertyName] = string.Empty;
-            }
-        }
-
-        return new BomTableTransferRow
-        {
-            DocumentType = documentType,
-            FileName = Path.GetFileNameWithoutExtension(path ?? string.Empty),
-            Configuration = string.IsNullOrWhiteSpace(configName) ? "Default" : configName,
-            Quantity = quantity,
-            Material = material,
-            FullPath = path ?? string.Empty,
-            Properties = properties,
-            AvailablePropertyNames = available
         };
     }
 
@@ -1098,6 +1184,180 @@ internal sealed class AddinHttpServer : IDisposable
         return new { saved, errors, warnings };
     }
 
+    private ModelDoc2 TryGetOpenModelByPath(string path)
+    {
+        try
+        {
+            var model = _swApp.GetOpenDocumentByName(path) as ModelDoc2;
+            if (model != null)
+            {
+                return model;
+            }
+        }
+        catch
+        {
+        }
+
+        var normalizedPath = NormalizePathForCompare(path);
+        try
+        {
+            var model = _swApp.GetFirstDocument() as ModelDoc2;
+            while (model != null)
+            {
+                var modelPath = NormalizePathForCompare(Safe(() => model.GetPathName()));
+                if (!string.IsNullOrWhiteSpace(modelPath)
+                    && string.Equals(modelPath, normalizedPath, StringComparison.OrdinalIgnoreCase))
+                {
+                    return model;
+                }
+
+                model = model.GetNext() as ModelDoc2;
+            }
+        }
+        catch
+        {
+        }
+
+        return null;
+    }
+
+    private void ActivateDocument(string title, string path)
+    {
+        foreach (var candidate in GetActivationTitleCandidates(title, path))
+        {
+            try
+            {
+                var errors = 0;
+                _swApp.ActivateDoc3(candidate, false, 0, ref errors);
+                AddinLog.Write($"ActivateDoc3 candidate={candidate}, errors={errors}");
+                if (errors == 0)
+                {
+                    return;
+                }
+            }
+            catch (Exception ex)
+            {
+                AddinLog.Write($"ActivateDoc3 failed candidate={candidate}: {ex.Message}");
+            }
+        }
+    }
+
+    private static IEnumerable<string> GetActivationTitleCandidates(string title, string path)
+    {
+        if (!string.IsNullOrWhiteSpace(title))
+        {
+            yield return title;
+        }
+
+        var fileName = System.IO.Path.GetFileName(path);
+        if (!string.IsNullOrWhiteSpace(fileName))
+        {
+            yield return fileName;
+        }
+
+        var fileNameWithoutExtension = System.IO.Path.GetFileNameWithoutExtension(path);
+        if (!string.IsNullOrWhiteSpace(fileNameWithoutExtension))
+        {
+            yield return fileNameWithoutExtension;
+        }
+    }
+
+    private void ActivateSolidWorksWindow()
+    {
+        TryActivateSolidWorksFrame();
+        var hwnd = GetSolidWorksFrameHwnd();
+        if (hwnd == IntPtr.Zero)
+        {
+            AddinLog.Write("ActivateSolidWorksWindow skipped: hwnd=0");
+            return;
+        }
+
+        var foregroundBefore = GetForegroundWindow();
+        var show = ShowWindow(hwnd, SwRestore);
+        var top = BringWindowToTop(hwnd);
+        var setPosTop = SetWindowPos(hwnd, HwndTopMost, 0, 0, 0, 0, SwpNoMove | SwpNoSize | SwpShowWindow);
+        var setPosNormal = SetWindowPos(hwnd, HwndNoTopMost, 0, 0, 0, 0, SwpNoMove | SwpNoSize | SwpShowWindow);
+        var foreground = SetForegroundWindow(hwnd);
+        SwitchToThisWindow(hwnd, true);
+
+        var foregroundAfter = GetForegroundWindow();
+        AddinLog.Write($"ActivateSolidWorksWindow hwnd={hwnd}, before={foregroundBefore}, after={foregroundAfter}, show={show}, top={top}, topMost={setPosTop}, normal={setPosNormal}, foreground={foreground}");
+    }
+
+    private void TryActivateSolidWorksFrame()
+    {
+        try
+        {
+            _swApp.Visible = true;
+        }
+        catch (Exception ex)
+        {
+            AddinLog.Write("ActivateSolidWorksWindow Visible ignored: " + ex.Message);
+        }
+
+        try
+        {
+            var frame = _swApp.Frame();
+            frame.GetType().InvokeMember(
+                "Activate",
+                System.Reflection.BindingFlags.InvokeMethod,
+                null,
+                frame,
+                null);
+        }
+        catch (Exception ex)
+        {
+            AddinLog.Write("ActivateSolidWorksWindow Frame.Activate ignored: " + ex.Message);
+        }
+    }
+
+    private IntPtr GetSolidWorksFrameHwnd()
+    {
+        try
+        {
+            var frame = _swApp.Frame();
+            var hwndValue = frame.GetType().InvokeMember(
+                "GetHWnd",
+                System.Reflection.BindingFlags.InvokeMethod,
+                null,
+                frame,
+                null);
+            var hwnd = Convert.ToInt64(hwndValue);
+            return hwnd == 0 ? IntPtr.Zero : new IntPtr(hwnd);
+        }
+        catch (Exception ex)
+        {
+            AddinLog.Write("GetSolidWorksFrameHwnd failed: " + ex.Message);
+            return IntPtr.Zero;
+        }
+    }
+
+    private static int GetDocumentTypeFromPath(string path)
+    {
+        var extension = System.IO.Path.GetExtension(path);
+        if (extension.Equals(".sldprt", StringComparison.OrdinalIgnoreCase)) return (int)swDocumentTypes_e.swDocPART;
+        if (extension.Equals(".sldasm", StringComparison.OrdinalIgnoreCase)) return (int)swDocumentTypes_e.swDocASSEMBLY;
+        if (extension.Equals(".slddrw", StringComparison.OrdinalIgnoreCase)) return (int)swDocumentTypes_e.swDocDRAWING;
+        return 0;
+    }
+
+    private static string NormalizePathForCompare(string path)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            return string.Empty;
+        }
+
+        try
+        {
+            return System.IO.Path.GetFullPath(path.Trim());
+        }
+        catch
+        {
+            return path.Trim();
+        }
+    }
+
     private ModelDoc2 GetActiveModel()
     {
         var model = _swApp.ActiveDoc as ModelDoc2;
@@ -1153,6 +1413,130 @@ internal sealed class AddinHttpServer : IDisposable
         return result;
     }
 
+    private static void WriteProperty(CustomPropertyManager manager, string name, string value)
+    {
+        if (string.IsNullOrWhiteSpace(name))
+        {
+            throw new InvalidOperationException("属性名不能为空");
+        }
+
+        try
+        {
+            var result = manager.Add3(name, (int)swCustomInfoType_e.swCustomInfoText, value ?? string.Empty, (int)swCustomPropertyAddOption_e.swCustomPropertyReplaceValue);
+            if (result >= 0)
+            {
+                return;
+            }
+        }
+        catch
+        {
+        }
+
+        try
+        {
+            var result = manager.Set2(name, value ?? string.Empty);
+            if (result >= 0)
+            {
+                return;
+            }
+        }
+        catch
+        {
+        }
+
+        try
+        {
+            var result = manager.Set(name, value ?? string.Empty);
+            if (result >= 0)
+            {
+                return;
+            }
+        }
+        catch
+        {
+        }
+
+        try
+        {
+            var result = manager.Add2(name, (int)swCustomInfoType_e.swCustomInfoText, value ?? string.Empty);
+            if (result >= 0)
+            {
+                return;
+            }
+        }
+        catch
+        {
+        }
+
+        throw new InvalidOperationException("属性写入失败: " + name);
+    }
+
+    private static void SaveModel(ModelDoc2 model)
+    {
+        var errors = 0;
+        var warnings = 0;
+        var saved = model.Save3((int)swSaveAsOptions_e.swSaveAsOptions_Silent, ref errors, ref warnings);
+        AddinLog.Write($"SaveModel: title={Safe(() => model.GetTitle())}, saved={saved}, errors={errors}, warnings={warnings}");
+        if (!saved || errors != 0)
+        {
+            throw new InvalidOperationException($"保存模型失败，错误码={errors}，警告码={warnings}");
+        }
+    }
+
+    private static string NormalizeConfigurationName(string name)
+    {
+        return string.IsNullOrWhiteSpace(name) || name.Equals("Default", StringComparison.OrdinalIgnoreCase)
+            ? string.Empty
+            : name.Trim();
+    }
+
+    private static void ActivateConfiguration(ModelDoc2 model, string configName)
+    {
+        if (string.IsNullOrWhiteSpace(configName) || configName.Equals("Default", StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
+        try
+        {
+            model.ShowConfiguration2(configName);
+        }
+        catch (Exception ex)
+        {
+            AddinLog.Write($"ActivateConfiguration ignored: {configName}: {ex.Message}");
+        }
+    }
+
+    private static List<double> GetModelBoxValues(ModelDoc2 model, string path)
+    {
+        var docType = GetDocumentTypeFromPath(path);
+        object corners = null;
+        if (docType == (int)swDocumentTypes_e.swDocPART)
+        {
+            try { corners = ((PartDoc)model).GetPartBox(true); } catch { }
+        }
+        else if (docType == (int)swDocumentTypes_e.swDocASSEMBLY)
+        {
+            try { corners = ((AssemblyDoc)model).GetBox(1); } catch { }
+        }
+
+        return ToDoubleList(corners);
+    }
+
+    private static List<double> ToDoubleList(object value)
+    {
+        var result = new List<double>();
+        if (value is Array array)
+        {
+            foreach (var item in array)
+            {
+                result.Add(Convert.ToDouble(item));
+            }
+        }
+
+        return result;
+    }
+
     private static List<string> ToIndexedStringList(object value)
     {
         if (value == null)
@@ -1199,27 +1583,6 @@ internal sealed class AddinHttpServer : IDisposable
         return row.GetType().GetProperty(name)?.GetValue(row)?.ToString() ?? string.Empty;
     }
 
-    private static string ReadTextFileWithEncodingDetection(string path)
-    {
-        var bytes = File.ReadAllBytes(path);
-        if (bytes.Length >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF)
-        {
-            return Encoding.UTF8.GetString(bytes, 3, bytes.Length - 3);
-        }
-
-        if (bytes.Length >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE)
-        {
-            return Encoding.Unicode.GetString(bytes, 2, bytes.Length - 2);
-        }
-
-        if (bytes.Length >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF)
-        {
-            return Encoding.BigEndianUnicode.GetString(bytes, 2, bytes.Length - 2);
-        }
-
-        return Encoding.Default.GetString(bytes);
-    }
-
     private static void TryDeleteFile(string path)
     {
         try
@@ -1245,30 +1608,13 @@ internal sealed class AddinHttpServer : IDisposable
 
     private sealed class BomTableCsvTransfer
     {
-        public string CsvText { get; set; }
+        public string CsvBase64 { get; set; }
+        public int CsvByteCount { get; set; }
         public string Separator { get; set; }
         public List<string> PropertyNames { get; set; } = new List<string>();
         public string MainPath { get; set; }
         public string MainConfiguration { get; set; }
         public int RowCount { get; set; }
-    }
-
-    private sealed class BomTableTransfer
-    {
-        public List<string> PropertyNames { get; set; } = new List<string>();
-        public List<BomTableTransferRow> Rows { get; set; } = new List<BomTableTransferRow>();
-    }
-
-    private sealed class BomTableTransferRow
-    {
-        public string DocumentType { get; set; }
-        public string FileName { get; set; }
-        public string Configuration { get; set; }
-        public int Quantity { get; set; }
-        public string Material { get; set; }
-        public string FullPath { get; set; }
-        public Dictionary<string, string> Properties { get; set; } = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        public List<string> AvailablePropertyNames { get; set; } = new List<string>();
     }
 
     private void WriteJson(HttpListenerContext context, object value)
@@ -1290,4 +1636,29 @@ internal sealed class AddinHttpServer : IDisposable
         try { return func(); }
         catch { return default; }
     }
+
+    private const int SwRestore = 9;
+    private static readonly IntPtr HwndTopMost = new IntPtr(-1);
+    private static readonly IntPtr HwndNoTopMost = new IntPtr(-2);
+    private const uint SwpNoSize = 0x0001;
+    private const uint SwpNoMove = 0x0002;
+    private const uint SwpShowWindow = 0x0040;
+
+    [DllImport("user32.dll")]
+    private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+
+    [DllImport("user32.dll")]
+    private static extern bool SetForegroundWindow(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    private static extern bool BringWindowToTop(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    private static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int x, int y, int cx, int cy, uint flags);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetForegroundWindow();
+
+    [DllImport("user32.dll")]
+    private static extern void SwitchToThisWindow(IntPtr hWnd, bool turnOn);
 }

@@ -33,7 +33,6 @@ namespace readbom;
 public partial class MainWindow : Window
 {
     private dynamic? _swApp;
-    private int _connectedSwPid;
     private readonly ObservableCollection<BomRow> _rows = [];
     private ICollectionView? _view;
     private readonly PropertyMappingConfig _propertyMapping;
@@ -43,6 +42,7 @@ public partial class MainWindow : Window
     private readonly Dictionary<DataGridColumn, object> _columnOriginalHeaders = new();
     private ThumbnailPreviewWindow? _thumbnailWindow;
     private BomRow? _thumbnailRow;
+    private BomRow? _contextMenuRow;
     private bool _thumbnailEnabled = true;
     private bool _headerFilterEnabled;
     private int _gridSizeLevel;
@@ -79,13 +79,17 @@ public partial class MainWindow : Window
         {
             ClearLog();
             ClearBomRows();
-            _swApp = SolidWorksReader.Connect();
-            var info = SolidWorksReader.CheckConnection(_swApp);
-            _connectedSwPid = info.ProcessId;
+            if (!await SolidWorksAddinClient.IsAvailableAsync())
+            {
+                throw new InvalidOperationException("SW Add-in HTTP 通道不可用。请确认 SolidWorks 已启动并启用 ReadBom.SwAddin。");
+            }
+
+            var info = await SolidWorksAddinClient.GetActiveDocumentInfoAsync(message => AppendLog(message));
+            _swApp = null;
             SetStatus("已连接 SolidWorks");
-            AppendLog("连接成功");
-            AppendDocumentTitleLog(info.ActiveDocumentTitle);
-            await AppendAddinConnectionStatusAsync();
+            AppendLog("连接成功: SW Add-in HTTP 通道");
+            AppendDocumentTitleLog(info.Title ?? string.Empty);
+            AppendLog("插件连接状态: 已连接");
         }
         catch (Exception ex)
         {
@@ -115,23 +119,15 @@ public partial class MainWindow : Window
             ReadButton.IsEnabled = false;
             AppendLog("开始读取属性/BOM");
             Action<ReadProgress> progress = ReportReadProgress;
-            List<BomRow> result;
-            if (await SolidWorksAddinClient.IsAvailableAsync())
+            if (!await SolidWorksAddinClient.IsAvailableAsync())
             {
-                AppendLog("使用 SW Add-in HTTP 通道读取 BOM");
-                var addinWatch = Stopwatch.StartNew();
-                result = await SolidWorksAddinClient.ReadBomAsync(_propertyMapping.PropertyNames, options, progress, message => AppendLog(message));
-                AppendLog($"读取计时: Add-in返回并转换完成 {addinWatch.ElapsedMilliseconds}ms");
+                throw new InvalidOperationException("SW Add-in HTTP 通道不可用。已停用主程序 COM 回退，请在 SolidWorks 中启用 ReadBom.SwAddin 后重试。");
             }
-            else
-            {
-                AppendLog("SW Add-in HTTP 通道不可用，回退 COM 读取");
-                _swApp ??= SolidWorksReader.Connect();
-                var swApp = _swApp;
-                var comWatch = Stopwatch.StartNew();
-                result = await Task.Run(() => SolidWorksReader.ReadBom(swApp, options, _propertyMapping, progress));
-                AppendLog($"读取计时: COM读取完成 {comWatch.ElapsedMilliseconds}ms");
-            }
+
+            AppendLog("使用 SW Add-in HTTP 通道读取 BOM");
+            var addinWatch = Stopwatch.StartNew();
+            var result = await SolidWorksAddinClient.ReadBomAsync(_propertyMapping.PropertyNames, options, progress, message => AppendLog(message));
+            AppendLog($"读取计时: Add-in返回并转换完成 {addinWatch.ElapsedMilliseconds}ms");
 
             var bindWatch = Stopwatch.StartNew();
             _rows.Clear();
@@ -142,6 +138,8 @@ public partial class MainWindow : Window
                 _rows.Add(item);
             }
             AppendLog($"读取计时: 表格绑定 {_rows.Count} 行 {bindWatch.ElapsedMilliseconds}ms");
+            await ResolveBomRelatedFilesAsync();
+            ValidateBomMaterials();
 
             SetStatus($"读取完成: {_rows.Count} 项");
             AppendLog($"读取完成，项目数: {_rows.Count}");
@@ -160,6 +158,15 @@ public partial class MainWindow : Window
         }
     }
 
+    private bool BlockPendingAddinMigration(string commandName)
+    {
+        var message = $"{commandName} 需要迁移到 SW Add-in 后再启用。主程序 COM 通道已停用。";
+        SetStatus("命令待迁移");
+        AppendLog(message, Brushes.Red);
+        MessageBox.Show(this, message, "命令待迁移", MessageBoxButton.OK, MessageBoxImage.Information);
+        return true;
+    }
+
     private async void SaveToSwButton_OnClick(object sender, RoutedEventArgs e)
     {
         try
@@ -173,8 +180,6 @@ public partial class MainWindow : Window
             BomGrid.CommitEdit(DataGridEditingUnit.Cell, true);
             BomGrid.CommitEdit(DataGridEditingUnit.Row, true);
 
-            _swApp ??= SolidWorksReader.Connect();
-            var swApp = _swApp;
             var rows = _rows.ToList();
             var propertyNames = _propertyMapping.PropertyNames.ToList();
             var sourceMode = GetPropertySourceMode();
@@ -185,12 +190,47 @@ public partial class MainWindow : Window
             AppendLog("开始保存 TXT 属性到 SW");
             Action<ReadProgress> progress = ReportReadProgress;
 
-            var result = await Task.Run(() => SolidWorksReader.SaveBomProperties(
-                swApp,
-                rows,
-                propertyNames,
+            var changedRows = rows
+                .Select(row => new { Row = row, Changes = row.GetChangedProperties(propertyNames) })
+                .Where(x => x.Changes.Count > 0)
+                .ToList();
+
+            if (changedRows.Count == 0)
+            {
+                progress(new ReadProgress("没有需要保存的修改项", 1, 1));
+                SetStatus("没有需要保存的修改项");
+                AppendLog("保存跳过: 没有需要保存的修改项");
+                FinishSaveProgress(0, 0);
+                return;
+            }
+
+            var result = await SolidWorksAddinClient.SavePropertiesBatchAsync(
+                changedRows.Select(x => new AddinSavePropertyRow
+                {
+                    Path = x.Row.FullPath,
+                    Configuration = x.Row.Configuration,
+                    DisplayName = string.IsNullOrWhiteSpace(x.Row.FileName) ? x.Row.FullPath : x.Row.FileName,
+                    Changes = x.Changes.Select(change => new AddinSavePropertyChange
+                    {
+                        Name = change.Name,
+                        Value = change.Value
+                    }).ToList()
+                }).ToList(),
                 sourceMode,
-                progress));
+                progress,
+                message => AppendLog(message));
+
+            if (result.FailedRows == 0)
+            {
+                foreach (var item in changedRows)
+                {
+                    item.Row.AcceptSavedChanges(item.Changes);
+                }
+            }
+            else
+            {
+                AppendLog("保存存在失败项: 为避免误清除修改标记，失败时保留所有修改单元格高亮", Brushes.Red);
+            }
 
             SetStatus($"保存完成: {result.SavedRows}/{result.TotalRows} 个修改行");
             AppendLog($"保存完成: 修改行成功 {result.SavedRows}/{result.TotalRows}，属性 {result.SavedProperties} 个，失败 {result.FailedRows} 项");
@@ -215,6 +255,11 @@ public partial class MainWindow : Window
     {
         try
         {
+            if (BlockPendingAddinMigration("复制重装"))
+            {
+                return;
+            }
+
             var targetRows = _rows.Skip(1).Where(x => x.IsOutsideMainAssemblyDirectory).ToList();
             if (targetRows.Count == 0)
             {
@@ -542,8 +587,6 @@ public partial class MainWindow : Window
                 return;
             }
 
-            _swApp ??= SolidWorksReader.Connect();
-            var swApp = _swApp;
             Action<ReadProgress> progress = ReportReadProgress;
 
             CalculateBlankSizeButton.IsEnabled = false;
@@ -551,12 +594,35 @@ public partial class MainWindow : Window
             ResetSaveProgress();
             AppendLog($"开始计算下料尺寸: 目标列 [{target.DisplayName}]，空值 {targetRows.Count} 项");
 
-            var result = await Task.Run(() => SolidWorksReader.CalculateBlankSizes(swApp, targetRows, target.PropertyName, progress));
+            var response = await SolidWorksAddinClient.GetBoxBatchAsync(
+                targetRows.Select(row => new AddinBlankSizeRow
+                {
+                    Path = row.FullPath,
+                    Configuration = row.Configuration,
+                    DisplayName = string.IsNullOrWhiteSpace(row.FileName) ? row.FullPath : row.FileName
+                }).ToList(),
+                progress,
+                message => AppendLog(message));
+
+            foreach (var item in response.Results.Where(item => item.Success))
+            {
+                var row = targetRows.FirstOrDefault(x => string.Equals(Path.GetFullPath(x.FullPath), Path.GetFullPath(item.Path ?? string.Empty), StringComparison.OrdinalIgnoreCase));
+                if (row is null)
+                {
+                    continue;
+                }
+
+                var blankSize = FormatBlankSizeFromBox(item.Box);
+                if (!string.IsNullOrWhiteSpace(blankSize))
+                {
+                    row.SetProperty(target.PropertyName, blankSize);
+                }
+            }
 
             RefreshBomGridSafely();
-            SetStatus($"下料尺寸计算完成: {result.UpdatedRows}/{result.TotalRows} 项");
-            AppendLog($"下料尺寸计算完成: 成功 {result.UpdatedRows}/{result.TotalRows}，失败 {result.FailedRows} 项");
-            FinishSaveProgress(result.UpdatedRows, result.TotalRows);
+            SetStatus($"下料尺寸计算完成: {response.UpdatedRows}/{response.TotalRows} 项");
+            AppendLog($"下料尺寸计算完成: 成功 {response.UpdatedRows}/{response.TotalRows}，失败 {response.FailedRows} 项");
+            FinishSaveProgress(response.UpdatedRows, response.TotalRows);
         }
         catch (Exception ex)
         {
@@ -606,8 +672,32 @@ public partial class MainWindow : Window
         SetStatus($"查找替换完成: {changed} 个单元格");
     }
 
+    private static string FormatBlankSizeFromBox(IReadOnlyList<double> values)
+    {
+        if (values.Count < 6)
+        {
+            return string.Empty;
+        }
+
+        var sizes = new[]
+        {
+            Math.Round(Math.Abs(values[3] - values[0]) * 1000, 1),
+            Math.Round(Math.Abs(values[4] - values[1]) * 1000, 1),
+            Math.Round(Math.Abs(values[5] - values[2]) * 1000, 1)
+        };
+        Array.Sort(sizes);
+        Array.Reverse(sizes);
+        return string.Join("x", sizes.Select(x => x.ToString("0.#", CultureInfo.InvariantCulture)));
+    }
+
     private void BomGrid_OnPreviewMouseLeftButtonUp(object sender, MouseButtonEventArgs e)
     {
+        var cell = FindParent<DataGridCell>(e.OriginalSource as DependencyObject);
+        if (cell?.DataContext is BomRow row)
+        {
+            _contextMenuRow = row;
+        }
+
         if (!_headerFilterEnabled)
         {
             return;
@@ -733,6 +823,129 @@ public partial class MainWindow : Window
             cell.Focus();
             BomGrid.CurrentCell = new DataGridCellInfo(cell);
         }
+
+        _contextMenuRow = cell.DataContext as BomRow;
+    }
+
+    private async void OpenModelMenuItem_OnClick(object sender, RoutedEventArgs e)
+    {
+        var row = GetCurrentBomRow();
+        if (row is null)
+        {
+            AppendLog("打开模型失败: 未选中 BOM 行", Brushes.Red);
+            return;
+        }
+
+        await OpenSolidWorksDocumentAsync(row.FullPath, "模型");
+    }
+
+    private async void OpenDrawingMenuItem_OnClick(object sender, RoutedEventArgs e)
+    {
+        var row = GetCurrentBomRow();
+        if (row is null)
+        {
+            AppendLog("打开工程图失败: 未选中 BOM 行", Brushes.Red);
+            return;
+        }
+
+        var drawingPath = ResolveDrawingPath(row);
+        if (string.IsNullOrWhiteSpace(drawingPath))
+        {
+            var displayName = string.IsNullOrWhiteSpace(row.FileName) ? row.FullPath : row.FileName;
+            AppendLog($"打开工程图失败: 未找到同名工程图 [{displayName}]", Brushes.Red);
+            return;
+        }
+
+        await OpenSolidWorksDocumentAsync(drawingPath, "工程图");
+    }
+
+    private BomRow? GetCurrentBomRow()
+    {
+        if (_contextMenuRow is not null)
+        {
+            return _contextMenuRow;
+        }
+
+        if (BomGrid.CurrentCell.Item is BomRow currentCellRow)
+        {
+            return currentCellRow;
+        }
+
+        if (BomGrid.CurrentItem is BomRow currentRow)
+        {
+            return currentRow;
+        }
+
+        return BomGrid.SelectedCells
+            .Select(cell => cell.Item)
+            .OfType<BomRow>()
+            .FirstOrDefault();
+    }
+
+    private async Task OpenSolidWorksDocumentAsync(string path, string displayType)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            AppendLog($"打开{displayType}失败: 缺少完整路径", Brushes.Red);
+            return;
+        }
+
+        try
+        {
+            var fullPath = Path.GetFullPath(path);
+            if (!File.Exists(fullPath))
+            {
+                AppendLog($"打开{displayType}失败: 文件不存在 [{fullPath}]", Brushes.Red);
+                return;
+            }
+
+            AppendLog($"打开{displayType}: {fullPath}");
+            var result = await SolidWorksAddinClient.OpenDocumentAsync(fullPath, message => AppendLog(message));
+            AppendLog(result.Accepted
+                ? $"已发送打开{displayType}命令: {result.Title}"
+                : $"已打开{displayType}: {result.Title}");
+        }
+        catch (Exception ex)
+        {
+            AppendLog($"打开{displayType}失败: {ex.Message}", Brushes.Red);
+        }
+    }
+
+    private static string ResolveDrawingPath(BomRow row)
+    {
+        if (string.IsNullOrWhiteSpace(row.FullPath))
+        {
+            return string.Empty;
+        }
+
+        if (Path.GetExtension(row.FullPath).Equals(".slddrw", StringComparison.OrdinalIgnoreCase))
+        {
+            return File.Exists(row.FullPath) ? row.FullPath : string.Empty;
+        }
+
+        try
+        {
+            var directory = Path.GetDirectoryName(row.FullPath);
+            var fileName = Path.GetFileNameWithoutExtension(row.FullPath);
+            if (string.IsNullOrWhiteSpace(directory) || string.IsNullOrWhiteSpace(fileName) || !Directory.Exists(directory))
+            {
+                return string.Empty;
+            }
+
+            var directPath = Path.Combine(directory, fileName + ".slddrw");
+            if (File.Exists(directPath))
+            {
+                return directPath;
+            }
+
+            return Directory.EnumerateFiles(directory, "*.slddrw")
+                .FirstOrDefault(path => string.Equals(Path.GetFileNameWithoutExtension(path), fileName, StringComparison.OrdinalIgnoreCase))
+                ?? string.Empty;
+        }
+        catch
+        {
+            return string.Empty;
+        }
     }
 
     private void BomGrid_OnCellEditEnding(object? sender, DataGridCellEditEndingEventArgs e)
@@ -748,6 +961,7 @@ public partial class MainWindow : Window
             .FirstOrDefault();
         if (row is not null)
         {
+            _contextMenuRow = row;
             _thumbnailRow = row;
             BomGrid.CurrentCell = e.AddedCells.First(x => x.Item == row);
         }
@@ -759,6 +973,7 @@ public partial class MainWindow : Window
     {
         if (BomGrid.CurrentCell.Item is BomRow row)
         {
+            _contextMenuRow = row;
             _thumbnailRow = row;
         }
 
@@ -1718,6 +1933,183 @@ public partial class MainWindow : Window
         _view?.Refresh();
     }
 
+    private void ValidateBomMaterials()
+    {
+        var unsetMaterialRows = 0;
+        foreach (var row in _rows.Skip(1))
+        {
+            row.Material = GetMaterialDisplayForValidation(row.DocumentType, row.Material);
+            row.HasUnsetMaterial = IsUnsetMaterial(row);
+            if (row.HasUnsetMaterial)
+            {
+                unsetMaterialRows++;
+            }
+        }
+
+        AppendLog(unsetMaterialRows > 0
+            ? $"材料校验: {unsetMaterialRows} 项 SW材料未设置，已标红"
+            : "材料校验: 全部零件 SW材料已设置",
+            unsetMaterialRows > 0 ? Brushes.Red : Brushes.Black);
+        _view?.Refresh();
+    }
+
+    private async Task ResolveBomRelatedFilesAsync()
+    {
+        if (_rows.Count == 0 || string.IsNullOrWhiteSpace(_rows[0].FullPath))
+        {
+            return;
+        }
+
+        var watch = Stopwatch.StartNew();
+        try
+        {
+            var relatedFiles = await SolidWorksAddinClient.GetRelatedFilesAsync(_rows[0].FullPath, message => AppendLog(message));
+            if (relatedFiles.Count == 0)
+            {
+                AppendLog("相关文件解析: 未获取到主装配体相关文件", Brushes.Red);
+                return;
+            }
+
+            var modelPathLookup = BuildRelatedModelPathLookup(relatedFiles);
+            var resolvedPathCount = 0;
+            var drawingCount = 0;
+            var typeResolvedCount = 0;
+            foreach (var row in _rows.Skip(1))
+            {
+                var lookupKey = NormalizeFileLookupKey(row.FileName);
+                string? resolvedPath = null;
+                modelPathLookup.TryGetValue(lookupKey, out resolvedPath);
+
+                if (!string.IsNullOrWhiteSpace(resolvedPath))
+                {
+                    if (string.IsNullOrWhiteSpace(row.FullPath)
+                        || !string.Equals(row.FullPath, resolvedPath, StringComparison.OrdinalIgnoreCase))
+                    {
+                        row.FullPath = resolvedPath;
+                        resolvedPathCount++;
+                    }
+                }
+
+                var resolvedType = GetDocumentTypeLabelFromPath(row.FullPath);
+                if (!string.IsNullOrWhiteSpace(resolvedType)
+                    && !string.Equals(row.DocumentType, resolvedType, StringComparison.OrdinalIgnoreCase))
+                {
+                    row.DocumentType = resolvedType;
+                    row.DocumentIconPath = GetDocumentIconPathFromLabelLocal(resolvedType);
+                    typeResolvedCount++;
+                }
+
+                var hasDrawing = HasDrawingForResolvedPath(row.FullPath, relatedFiles);
+                row.DrawingStatus = hasDrawing ? "有工程图" : "无工程图";
+                row.DrawingIconPath = hasDrawing ? "pack://application:,,,/Assets/drawing.png" : string.Empty;
+                if (hasDrawing)
+                {
+                    drawingCount++;
+                }
+            }
+
+            _view?.Refresh();
+            AppendLog($"相关文件解析: 获取 {relatedFiles.Count} 个相关文件，回填完整路径 {resolvedPathCount} 项，修正类型 {typeResolvedCount} 项，工程图 {drawingCount} 项，用时 {watch.ElapsedMilliseconds}ms");
+        }
+        catch (Exception ex)
+        {
+            AppendLog($"相关文件解析失败: {ex.Message}", Brushes.Red);
+        }
+    }
+
+    private static Dictionary<string, string> BuildRelatedModelPathLookup(IEnumerable<string> relatedFiles)
+    {
+        var lookup = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var path in relatedFiles)
+        {
+            var extension = Path.GetExtension(path);
+            if (!extension.Equals(".sldprt", StringComparison.OrdinalIgnoreCase)
+                && !extension.Equals(".sldasm", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            var fileName = NormalizeFileLookupKey(Path.GetFileNameWithoutExtension(path));
+            if (!string.IsNullOrWhiteSpace(fileName) && !lookup.ContainsKey(fileName))
+            {
+                lookup[fileName] = path;
+            }
+        }
+
+        return lookup;
+    }
+
+    private static bool HasDrawingForResolvedPath(string modelPath, IReadOnlyCollection<string> relatedFiles)
+    {
+        if (string.IsNullOrWhiteSpace(modelPath))
+        {
+            return false;
+        }
+
+        var fileName = NormalizeFileLookupKey(Path.GetFileNameWithoutExtension(modelPath));
+        if (string.IsNullOrWhiteSpace(fileName))
+        {
+            return false;
+        }
+
+        if (relatedFiles.Any(path =>
+                Path.GetExtension(path).Equals(".slddrw", StringComparison.OrdinalIgnoreCase)
+                && string.Equals(NormalizeFileLookupKey(Path.GetFileNameWithoutExtension(path)), fileName, StringComparison.OrdinalIgnoreCase)))
+        {
+            return true;
+        }
+
+        try
+        {
+            var directory = Path.GetDirectoryName(modelPath);
+            return !string.IsNullOrWhiteSpace(directory)
+                   && Directory.Exists(directory)
+                   && Directory.EnumerateFiles(directory, "*.slddrw")
+                       .Any(path => string.Equals(NormalizeFileLookupKey(Path.GetFileNameWithoutExtension(path)), fileName, StringComparison.OrdinalIgnoreCase));
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static string NormalizeFileLookupKey(string? value)
+    {
+        var key = Path.GetFileNameWithoutExtension(value ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(key))
+        {
+            return string.Empty;
+        }
+
+        var atIndex = key.IndexOf('@');
+        if (atIndex > 0)
+        {
+            key = key[..atIndex];
+        }
+
+        return key.Trim();
+    }
+
+    private static string GetDocumentTypeLabelFromPath(string path)
+    {
+        var extension = Path.GetExtension(path ?? string.Empty);
+        if (extension.Equals(".sldasm", StringComparison.OrdinalIgnoreCase)) return "装配体";
+        if (extension.Equals(".sldprt", StringComparison.OrdinalIgnoreCase)) return "零件";
+        if (extension.Equals(".slddrw", StringComparison.OrdinalIgnoreCase)) return "工程图";
+        return string.Empty;
+    }
+
+    private static string GetDocumentIconPathFromLabelLocal(string label)
+    {
+        return label switch
+        {
+            "装配体" => "pack://application:,,,/Assets/assembly.png",
+            "零件" => "pack://application:,,,/Assets/part.png",
+            "工程图" => "pack://application:,,,/Assets/drawing.png",
+            _ => string.Empty
+        };
+    }
+
     private static bool IsUnsetMaterial(BomRow row)
     {
         if (!row.DocumentType.Equals("零件", StringComparison.OrdinalIgnoreCase))
@@ -1725,8 +2117,65 @@ public partial class MainWindow : Window
             return false;
         }
 
-        return string.IsNullOrWhiteSpace(row.Material)
-               || row.Material.Equals("未设置", StringComparison.OrdinalIgnoreCase);
+        var material = NormalizeMaterialValueForValidation(row.Material);
+        return string.IsNullOrWhiteSpace(material)
+               || material.Equals("未设置", StringComparison.OrdinalIgnoreCase)
+               || material.Equals("<未指定>", StringComparison.OrdinalIgnoreCase)
+               || material.Equals("未指定", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string GetMaterialDisplayForValidation(string? documentType, string? material)
+    {
+        var normalized = NormalizeMaterialValueForValidation(material);
+        if (!string.IsNullOrWhiteSpace(normalized)
+            && !normalized.Equals("<未指定>", StringComparison.OrdinalIgnoreCase)
+            && !normalized.Equals("未指定", StringComparison.OrdinalIgnoreCase)
+            && !normalized.Equals("未设置", StringComparison.OrdinalIgnoreCase))
+        {
+            return normalized;
+        }
+
+        return string.Equals(documentType, "装配体", StringComparison.OrdinalIgnoreCase) ? "无需设置" : "未设置";
+    }
+
+    private static string NormalizeMaterialValueForValidation(string? material)
+    {
+        var value = (material ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return string.Empty;
+        }
+
+        if (value.StartsWith("$PRPSHEET:", StringComparison.OrdinalIgnoreCase))
+        {
+            value = value[10..].Trim();
+            value = RemoveMaterialFormulaPropertyName(value);
+        }
+        else if (value.StartsWith("$PRP:", StringComparison.OrdinalIgnoreCase))
+        {
+            value = value[5..].Trim();
+            value = RemoveMaterialFormulaPropertyName(value);
+        }
+
+        return value.Trim('"', '\'', ' ', '\t');
+    }
+
+    private static string RemoveMaterialFormulaPropertyName(string value)
+    {
+        value = value.Trim('"', '\'', ' ', '\t');
+        var separatorIndex = value.IndexOfAny([' ', '\t']);
+        if (separatorIndex <= 0)
+        {
+            return value;
+        }
+
+        var propertyName = value[..separatorIndex].Trim('"', '\'', ' ', '\t');
+        var resolvedValue = value[(separatorIndex + 1)..].Trim('"', '\'', ' ', '\t');
+        return propertyName.Equals("SW-Material", StringComparison.OrdinalIgnoreCase)
+               || propertyName.Equals("\u6750\u8d28", StringComparison.OrdinalIgnoreCase)
+               || propertyName.Equals("\u6750\u6599", StringComparison.OrdinalIgnoreCase)
+            ? resolvedValue
+            : value;
     }
 
     private static string GetNormalizedDirectory(string path)
@@ -2232,6 +2681,27 @@ public sealed record BlankSizeResult(int TotalRows, int UpdatedRows, int FailedR
 
 public sealed record PropertyChange(string Name, string Value);
 
+public sealed class AddinSavePropertyRow
+{
+    public string Path { get; init; } = string.Empty;
+    public string Configuration { get; init; } = string.Empty;
+    public string DisplayName { get; init; } = string.Empty;
+    public List<AddinSavePropertyChange> Changes { get; init; } = [];
+}
+
+public sealed class AddinSavePropertyChange
+{
+    public string Name { get; init; } = string.Empty;
+    public string Value { get; init; } = string.Empty;
+}
+
+public sealed class AddinBlankSizeRow
+{
+    public string Path { get; init; } = string.Empty;
+    public string Configuration { get; init; } = string.Empty;
+    public string DisplayName { get; init; } = string.Empty;
+}
+
 public sealed class PropertyMappingConfig
 {
     public static string DefaultPath => Path.Combine(AppContext.BaseDirectory, "property-mapping.txt");
@@ -2336,14 +2806,14 @@ public sealed class PropertyMappingConfig
 public sealed class BomRow
 {
     public int Index { get; set; }
-    public string DocumentType { get; init; } = string.Empty;
-    public string DocumentIconPath { get; init; } = string.Empty;
-    public string DrawingStatus { get; init; } = string.Empty;
-    public string DrawingIconPath { get; init; } = string.Empty;
+    public string DocumentType { get; set; } = string.Empty;
+    public string DocumentIconPath { get; set; } = string.Empty;
+    public string DrawingStatus { get; set; } = string.Empty;
+    public string DrawingIconPath { get; set; } = string.Empty;
     public string FileName { get; init; } = string.Empty;
     public string Configuration { get; init; } = string.Empty;
     public int Quantity { get; set; }
-    public string Material { get; init; } = string.Empty;
+    public string Material { get; set; } = string.Empty;
     public Dictionary<string, string> Properties { get; init; } = new(StringComparer.OrdinalIgnoreCase);
     public Dictionary<string, string> OriginalProperties { get; init; } = new(StringComparer.OrdinalIgnoreCase);
     public List<string> AvailablePropertyNames { get; init; } = [];
@@ -2739,6 +3209,72 @@ internal static class SolidWorksAddinClient
         }
     }
 
+    public static async Task<AddinActiveDocumentInfo> GetActiveDocumentInfoAsync(Action<string>? log = null)
+    {
+        return await PostCommandAsync<AddinActiveDocumentInfo>(
+            new { Command = "active-document" },
+            TimeSpan.FromSeconds(10),
+            log);
+    }
+
+    public static async Task<AddinOpenDocumentResult> OpenDocumentAsync(string path, Action<string>? log = null)
+    {
+        return await PostCommandAsync<AddinOpenDocumentResult>(
+            new { Command = "open-document", Path = path },
+            TimeSpan.FromMinutes(2),
+            log);
+    }
+
+    public static async Task<List<string>> GetRelatedFilesAsync(string mainPath, Action<string>? log = null)
+    {
+        var response = await PostCommandAsync<AddinRelatedFilesResult>(
+            new { Command = "related-files", Path = mainPath },
+            TimeSpan.FromMinutes(2),
+            log);
+        return response.Files ?? [];
+    }
+
+    public static async Task<SaveResult> SavePropertiesBatchAsync(
+        IReadOnlyList<AddinSavePropertyRow> rows,
+        PropertySourceMode sourceMode,
+        Action<ReadProgress>? progress = null,
+        Action<string>? log = null)
+    {
+        var total = Math.Max(rows.Count, 1);
+        progress?.Invoke(new ReadProgress("保存TXT属性到SW(Add-in)", 0, total));
+        var response = await PostCommandAsync<AddinSavePropertiesResult>(
+            new
+            {
+                Command = "save-properties-batch",
+                PropertySourceMode = sourceMode.ToString(),
+                SaveRows = rows
+            },
+            TimeSpan.FromMinutes(10),
+            log);
+        progress?.Invoke(new ReadProgress("保存TXT属性到SW(Add-in)", rows.Count, total));
+        return new SaveResult(response.TotalRows, response.SavedRows, response.FailedRows, response.SavedProperties);
+    }
+
+    public static async Task<AddinBoxBatchResult> GetBoxBatchAsync(
+        IReadOnlyList<AddinBlankSizeRow> rows,
+        Action<ReadProgress>? progress = null,
+        Action<string>? log = null)
+    {
+        var total = Math.Max(rows.Count, 1);
+        progress?.Invoke(new ReadProgress("获取包围盒(Add-in)", 0, total));
+        var response = await PostCommandAsync<AddinBoxBatchResult>(
+            new
+            {
+                Command = "calculate-blank-size",
+                BlankRows = rows
+            },
+            TimeSpan.FromMinutes(10),
+            log);
+        progress?.Invoke(new ReadProgress("获取包围盒(Add-in)", rows.Count, total));
+        response.Results ??= [];
+        return response;
+    }
+
     public static async Task<List<BomRow>> ReadBomAsync(
         IReadOnlyList<string> propertyNames,
         ReadOptions options,
@@ -2759,7 +3295,7 @@ internal static class SolidWorksAddinClient
 
         var convertWatch = Stopwatch.StartNew();
         var rows = new List<BomRow>();
-        if (!string.IsNullOrWhiteSpace(response.TableCsv?.CsvText))
+        if (!string.IsNullOrWhiteSpace(response.TableCsv?.CsvBase64))
         {
             rows.AddRange(CreateBomRowsFromCsv(response.TableCsv, propertyNames, log));
         }
@@ -2822,9 +3358,16 @@ internal static class SolidWorksAddinClient
 
     private static List<BomRow> CreateBomRowsFromCsv(AddinBomCsvTable table, IReadOnlyList<string> fallbackPropertyNames, Action<string>? log)
     {
+        var decodeWatch = Stopwatch.StartNew();
+        var csvBytes = Convert.FromBase64String(table.CsvBase64 ?? string.Empty);
+        var csvText = DecodeCsvBytes(csvBytes);
+        log?.Invoke($"Add-in计时: CSV字节解码 {csvBytes.Length} bytes -> {csvText.Length} chars {decodeWatch.ElapsedMilliseconds}ms");
+        SaveLastBomCsv(csvText, log);
+
         var parseWatch = Stopwatch.StartNew();
-        var records = ParseDelimitedText(table.CsvText ?? string.Empty, table.Separator);
-        log?.Invoke($"Add-in计时: CSV解析 {records.Count} 行 {parseWatch.ElapsedMilliseconds}ms");
+        var delimiter = DetectDelimitedTextSeparator(csvText, table.Separator);
+        var records = ParseDelimitedText(csvText, delimiter);
+        log?.Invoke($"Add-in计时: CSV解析 {records.Count} 行，分隔符 [{DescribeDelimiter(delimiter)}]，{parseWatch.ElapsedMilliseconds}ms");
         if (records.Count == 0)
         {
             return [];
@@ -2838,12 +3381,15 @@ internal static class SolidWorksAddinClient
                 .ToList();
         var headerIndex = FindCsvHeaderRow(records, propertyNames);
         var headers = records[headerIndex].Select(NormalizeCsvHeader).ToList();
-        var quantityIndex = FindCsvColumn(headers, "数量", "QTY", "QTY.", "Quantity");
-        var fileNameIndex = FindCsvColumn(headers, "零件号", "零件编号", "Part Number", "PART NUMBER", "文件名", "File Name", "名称");
-        var configurationIndex = FindCsvColumn(headers, "配置", "Configuration", "Config");
-        var fullPathIndex = FindCsvColumn(headers, "完整路径", "FullPath", "Path");
-        var materialIndex = FindCsvColumn(headers, "SW材料", "SW-Material");
+        var quantityIndex = FindCsvColumn(headers, "\u6570\u91cf", "QTY", "QTY.", "Quantity");
+        var fileNameIndex = FindCsvColumn(headers, "\u96f6\u4ef6\u53f7", "\u96f6\u4ef6\u7f16\u53f7", "Part Number", "PART NUMBER", "\u6587\u4ef6\u540d", "File Name", "\u540d\u79f0", "\u4ee3\u53f7", "PART NO.");
+        var configurationIndex = FindCsvColumn(headers, "\u914d\u7f6e", "Configuration", "Config");
+        var fullPathIndex = FindCsvColumn(headers, "\u5b8c\u6574\u8def\u5f84", "FullPath", "Path");
+        var materialIndex = FindCsvColumn(headers, "SW\u6750\u6599", "SW-Material");
         var propertyIndexes = propertyNames.ToDictionary(name => name, name => FindCsvColumn(headers, name), StringComparer.OrdinalIgnoreCase);
+        log?.Invoke($"CSV表头: 行 {headerIndex + 1}，列数 {headers.Count}，{string.Join(" | ", headers)}");
+        log?.Invoke($"CSV列索引: 文件名={fileNameIndex}, 数量={quantityIndex}, 配置={configurationIndex}, SW材料={materialIndex}");
+        log?.Invoke($"CSV行样例: {string.Join("; ", records.Skip(headerIndex + 1).Take(3).Select(row => row.Count + "列"))}");
 
         var rows = new List<BomRow>();
         if (!string.IsNullOrWhiteSpace(table.MainPath))
@@ -2879,6 +3425,11 @@ internal static class SolidWorksAddinClient
             if (string.IsNullOrWhiteSpace(rawFileName))
             {
                 rawFileName = PickCsvDisplayName(record, headers, quantityIndex, materialIndex, propertyIndexes.Values);
+            }
+
+            if (ShouldSkipCsvBomRow(rawFileName, record, headers))
+            {
+                continue;
             }
 
             var documentType = InferDocumentType(fullPath, rawFileName);
@@ -2922,9 +3473,95 @@ internal static class SolidWorksAddinClient
         return properties;
     }
 
-    private static List<List<string>> ParseDelimitedText(string text, string? separator)
+    private static char DetectDelimitedTextSeparator(string text, string? requestedSeparator)
     {
-        var delimiter = string.IsNullOrEmpty(separator) ? ',' : separator[0];
+        var candidates = new List<char>();
+        if (!string.IsNullOrEmpty(requestedSeparator))
+        {
+            candidates.Add(requestedSeparator[0]);
+        }
+
+        foreach (var candidate in new[] { ',', '\t', ';', '|' })
+        {
+            if (!candidates.Contains(candidate))
+            {
+                candidates.Add(candidate);
+            }
+        }
+
+        var sampleLines = text
+            .Split(new[] { "\r\n", "\n", "\r" }, StringSplitOptions.None)
+            .Where(line => !string.IsNullOrWhiteSpace(line))
+            .Take(10)
+            .ToList();
+        if (sampleLines.Count == 0)
+        {
+            return candidates[0];
+        }
+
+        return candidates
+            .Select(candidate => new
+            {
+                Separator = candidate,
+                Score = sampleLines.Sum(line => CountUnquotedSeparator(line, candidate))
+            })
+            .OrderByDescending(x => x.Score)
+            .First().Separator;
+    }
+
+    private static int CountUnquotedSeparator(string line, char separator)
+    {
+        var count = 0;
+        var inQuotes = false;
+        for (var i = 0; i < line.Length; i++)
+        {
+            var ch = line[i];
+            if (ch == '"' && inQuotes && i + 1 < line.Length && line[i + 1] == '"')
+            {
+                i++;
+                continue;
+            }
+
+            if (ch == '"')
+            {
+                inQuotes = !inQuotes;
+            }
+            else if (!inQuotes && ch == separator)
+            {
+                count++;
+            }
+        }
+
+        return count;
+    }
+
+    private static string DescribeDelimiter(char delimiter)
+    {
+        return delimiter switch
+        {
+            '\t' => "Tab",
+            ',' => "逗号",
+            ';' => "分号",
+            _ => delimiter.ToString()
+        };
+    }
+
+    private static void SaveLastBomCsv(string csvText, Action<string>? log)
+    {
+        try
+        {
+            var path = Path.Combine(AppContext.BaseDirectory, "last-bom.csv");
+            File.WriteAllText(path, csvText, Encoding.UTF8);
+            log?.Invoke($"CSV调试文件: {path}");
+        }
+        catch (Exception ex)
+        {
+            log?.Invoke($"CSV调试文件保存失败: {ex.Message}");
+        }
+    }
+
+    private static List<List<string>> ParseDelimitedText(string text, char delimiter)
+    {
         var rows = new List<List<string>>();
         var row = new List<string>();
         var cell = new StringBuilder();
@@ -2994,13 +3631,124 @@ internal static class SolidWorksAddinClient
         return rows;
     }
 
+    private static string DecodeCsvBytes(byte[] bytes)
+    {
+        if (bytes.Length >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF)
+        {
+            return Encoding.UTF8.GetString(bytes, 3, bytes.Length - 3);
+        }
+
+        if (bytes.Length >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE)
+        {
+            return Encoding.Unicode.GetString(bytes, 2, bytes.Length - 2);
+        }
+
+        if (bytes.Length >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF)
+        {
+            return Encoding.BigEndianUnicode.GetString(bytes, 2, bytes.Length - 2);
+        }
+
+        TryRegisterCodePages();
+
+        return GetCsvDecodeCandidates()
+            .Select(encoding =>
+            {
+                var text = encoding.GetString(bytes);
+                return new
+                {
+                    Text = text,
+                    Score = ScoreDecodedCsvText(text)
+                };
+            })
+            .OrderByDescending(candidate => candidate.Score)
+            .First()
+            .Text;
+    }
+
+    private static void TryRegisterCodePages()
+    {
+        try
+        {
+            Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
+        }
+        catch
+        {
+            // The provider can be registered only once. If it is unavailable, the candidate list falls back.
+        }
+    }
+
+    private static IEnumerable<Encoding> GetCsvDecodeCandidates()
+    {
+        foreach (var codePage in new[] { 54936, 936 })
+        {
+            Encoding? encoding = null;
+            try
+            {
+                encoding = Encoding.GetEncoding(codePage);
+            }
+            catch
+            {
+                // Ignore unavailable code pages.
+            }
+
+            if (encoding is not null)
+            {
+                yield return encoding;
+            }
+        }
+
+        yield return Encoding.UTF8;
+        yield return Encoding.Default;
+    }
+
+    private static int ScoreDecodedCsvText(string text)
+    {
+        var score = 0;
+        foreach (var token in new[]
+                 {
+                     "\u9879\u76ee\u53f7",
+                     "\u96f6\u4ef6\u53f7",
+                     "\u8bf4\u660e",
+                     "\u6570\u91cf",
+                     "\u6750\u6599",
+                     "\u7269\u6599\u7f16\u7801",
+                     "\u96f6\u4ef6\u56fe\u53f7",
+                     "SW\u6750\u6599"
+                 })
+        {
+            score += CountOccurrences(text, token) * 20;
+        }
+
+        score += CountOccurrences(text, ",") / 10;
+        score -= CountOccurrences(text, "\uFFFD") * 50;
+        return score;
+    }
+
+    private static int CountOccurrences(string text, string value)
+    {
+        if (string.IsNullOrEmpty(value))
+        {
+            return 0;
+        }
+
+        var count = 0;
+        var index = 0;
+        while ((index = text.IndexOf(value, index, StringComparison.OrdinalIgnoreCase)) >= 0)
+        {
+            count++;
+            index += value.Length;
+        }
+
+        return count;
+    }
+
     private static int FindCsvHeaderRow(IReadOnlyList<List<string>> records, IReadOnlyList<string> propertyNames)
     {
         for (var i = 0; i < records.Count; i++)
         {
             var headers = records[i].Select(NormalizeCsvHeader).ToList();
-            if (FindCsvColumn(headers, "SW材料", "SW-Material") >= 0
-                || FindCsvColumn(headers, "数量", "QTY", "QTY.", "Quantity") >= 0
+            if (FindCsvColumn(headers, "SW\u6750\u6599", "SW-Material") >= 0
+                || FindCsvColumn(headers, "\u6570\u91cf", "QTY", "QTY.", "Quantity") >= 0
                 || propertyNames.Any(name => FindCsvColumn(headers, name) >= 0))
             {
                 return i;
@@ -3041,7 +3789,39 @@ internal static class SolidWorksAddinClient
 
     private static string NormalizeCsvHeader(string? value)
     {
-        return (value ?? string.Empty).Trim().Trim('"').Replace("\r", " ").Replace("\n", " ");
+        return StripCsvHtmlTags(value ?? string.Empty)
+            .Trim()
+            .Trim('"')
+            .Replace("\r", " ")
+            .Replace("\n", " ");
+    }
+
+    private static string StripCsvHtmlTags(string value)
+    {
+        var builder = new StringBuilder(value.Length);
+        var insideTag = false;
+        foreach (var ch in value)
+        {
+            if (ch == '<')
+            {
+                insideTag = true;
+                continue;
+            }
+
+            if (insideTag)
+            {
+                if (ch == '>')
+                {
+                    insideTag = false;
+                }
+
+                continue;
+            }
+
+            builder.Append(ch);
+        }
+
+        return builder.ToString();
     }
 
     private static string GetCsvCell(IReadOnlyList<string> row, int index)
@@ -3081,6 +3861,30 @@ internal static class SolidWorksAddinClient
         return record.FirstOrDefault(value => !string.IsNullOrWhiteSpace(value))?.Trim() ?? string.Empty;
     }
 
+    private static bool ShouldSkipCsvBomRow(string rawFileName, IReadOnlyList<string> record, IReadOnlyList<string> headers)
+    {
+        if (string.IsNullOrWhiteSpace(rawFileName))
+        {
+            return true;
+        }
+
+        var normalized = NormalizeCsvHeader(rawFileName);
+        if (headers.Any(header => string.Equals(header, normalized, StringComparison.OrdinalIgnoreCase)))
+        {
+            return true;
+        }
+
+        if (normalized.Equals("总计", StringComparison.OrdinalIgnoreCase)
+            || normalized.Equals("合计", StringComparison.OrdinalIgnoreCase)
+            || normalized.Equals("TOTAL", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        return record.Count(value => !string.IsNullOrWhiteSpace(value)) <= 1
+               && int.TryParse(normalized, NumberStyles.Integer, CultureInfo.CurrentCulture, out _);
+    }
+
     private static int ParseCsvQuantity(string value)
     {
         if (int.TryParse(value, NumberStyles.Integer, CultureInfo.CurrentCulture, out var quantity))
@@ -3113,12 +3917,57 @@ internal static class SolidWorksAddinClient
 
     private static string GetMaterialDisplay(string? documentType, string? material)
     {
-        if (!string.IsNullOrWhiteSpace(material))
+        var normalized = NormalizeMaterialValue(material);
+        if (!string.IsNullOrWhiteSpace(normalized)
+            && !normalized.Equals("<未指定>", StringComparison.OrdinalIgnoreCase)
+            && !normalized.Equals("未指定", StringComparison.OrdinalIgnoreCase)
+            && !normalized.Equals("未设置", StringComparison.OrdinalIgnoreCase))
         {
-            return material;
+            return normalized;
         }
 
         return string.Equals(documentType, "装配体", StringComparison.OrdinalIgnoreCase) ? "无需设置" : "未设置";
+    }
+
+    private static string NormalizeMaterialValue(string? material)
+    {
+        var value = (material ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return string.Empty;
+        }
+
+        if (value.StartsWith("$PRP:", StringComparison.OrdinalIgnoreCase))
+        {
+            value = value[5..].Trim();
+            value = RemoveMaterialFormulaPropertyName(value);
+        }
+        else if (value.StartsWith("$PRPSHEET:", StringComparison.OrdinalIgnoreCase))
+        {
+            value = value[10..].Trim();
+            value = RemoveMaterialFormulaPropertyName(value);
+        }
+
+        value = value.Trim('"', '\'', ' ', '\t');
+        return value;
+    }
+
+    private static string RemoveMaterialFormulaPropertyName(string value)
+    {
+        value = value.Trim('"', '\'', ' ', '\t');
+        var separatorIndex = value.IndexOfAny([' ', '\t']);
+        if (separatorIndex <= 0)
+        {
+            return value;
+        }
+
+        var propertyName = value[..separatorIndex].Trim('"', '\'', ' ', '\t');
+        var resolvedValue = value[(separatorIndex + 1)..].Trim('"', '\'', ' ', '\t');
+        return propertyName.Equals("SW-Material", StringComparison.OrdinalIgnoreCase)
+               || propertyName.Equals("\u6750\u8d28", StringComparison.OrdinalIgnoreCase)
+               || propertyName.Equals("\u6750\u6599", StringComparison.OrdinalIgnoreCase)
+            ? resolvedValue
+            : value;
     }
 
     private static async Task<T> PostCommandAsync<T>(object request, TimeSpan timeout, Action<string>? log = null)
@@ -3188,6 +4037,54 @@ internal static class SolidWorksAddinClient
         public string? Error { get; set; }
     }
 
+    public sealed class AddinActiveDocumentInfo
+    {
+        public string? Title { get; set; }
+        public string? Path { get; set; }
+        public string? Configuration { get; set; }
+    }
+
+    public sealed class AddinOpenDocumentResult
+    {
+        public string? Path { get; set; }
+        public string? Title { get; set; }
+        public bool Accepted { get; set; }
+        public bool WasOpen { get; set; }
+        public int Errors { get; set; }
+        public int Warnings { get; set; }
+    }
+
+    private sealed class AddinRelatedFilesResult
+    {
+        public string? MainPath { get; set; }
+        public List<string>? Files { get; set; }
+    }
+
+    private sealed class AddinSavePropertiesResult
+    {
+        public int TotalRows { get; set; }
+        public int SavedRows { get; set; }
+        public int FailedRows { get; set; }
+        public int SavedProperties { get; set; }
+    }
+
+    public sealed class AddinBoxBatchResult
+    {
+        public int TotalRows { get; set; }
+        public int UpdatedRows { get; set; }
+        public int FailedRows { get; set; }
+        public List<AddinBoxResult> Results { get; set; } = [];
+    }
+
+    public sealed class AddinBoxResult
+    {
+        public string? Path { get; set; }
+        public string? DisplayName { get; set; }
+        public List<double> Box { get; set; } = [];
+        public bool Success { get; set; }
+        public string? Error { get; set; }
+    }
+
     private sealed class ReadBomResponse
     {
         public List<AddinBomRow>? Rows { get; set; }
@@ -3203,7 +4100,8 @@ internal static class SolidWorksAddinClient
 
     private sealed class AddinBomCsvTable
     {
-        public string? CsvText { get; set; }
+        public string? CsvBase64 { get; set; }
+        public int CsvByteCount { get; set; }
         public string? Separator { get; set; }
         public List<string>? PropertyNames { get; set; }
         public string? MainPath { get; set; }
@@ -3298,6 +4196,61 @@ internal static class SolidWorksReader
             swProcessCount > 0
                 ? $"检测到 {swProcessCount} 个 SLDWORKS.exe，但没有找到可用的 SolidWorks COM 实例。{rotSummary}。请确认本工具和 SolidWorks 使用相同权限运行。"
                 : "未检测到已运行的 SolidWorks 实例。请先启动并打开模型后再连接。");
+    }
+
+    internal static List<string> GetRelatedFiles(dynamic swApp, string mainAssemblyPath)
+    {
+        var result = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (string.IsNullOrWhiteSpace(mainAssemblyPath))
+        {
+            return [];
+        }
+
+        mainAssemblyPath = NormalizePathForCompare(mainAssemblyPath);
+        AddRelatedFile(result, mainAssemblyPath);
+
+        try
+        {
+            object? dependencies = TryAsStrongSwApp(swApp, out SldWorks.SldWorks typedApp)
+                ? typedApp.GetDocumentDependencies2(mainAssemblyPath, true, true, true)
+                : swApp.GetDocumentDependencies2(mainAssemblyPath, true, true, true);
+
+            foreach (var value in ToStringList(dependencies))
+            {
+                AddRelatedFile(result, value);
+            }
+        }
+        catch
+        {
+        }
+
+        return result.ToList();
+    }
+
+    private static void AddRelatedFile(ISet<string> files, string value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return;
+        }
+
+        var candidate = value.Trim();
+        var extension = Path.GetExtension(candidate);
+        if (!extension.Equals(".sldprt", StringComparison.OrdinalIgnoreCase)
+            && !extension.Equals(".sldasm", StringComparison.OrdinalIgnoreCase)
+            && !extension.Equals(".slddrw", StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
+        try
+        {
+            files.Add(Path.GetFullPath(candidate));
+        }
+        catch
+        {
+            files.Add(candidate);
+        }
     }
 
     private static bool TryGetActiveSolidWorksObject(out object? runningObject)
@@ -5516,6 +6469,161 @@ internal static class SolidWorksReader
         }
     }
 
+    internal static string OpenDocument(dynamic swApp, string path)
+    {
+        var model = OpenModelVisible(swApp, path, out string openError);
+        if (model is null)
+        {
+            throw new InvalidOperationException(string.IsNullOrWhiteSpace(openError)
+                ? $"无法打开文件: {path}"
+                : $"无法打开文件: {path}。{openError}");
+        }
+
+        var title = GetModelTitleSafe(model);
+        ActivateOpenedDocument(swApp, title, path);
+        ActivateSolidWorksWindow(swApp);
+        return string.IsNullOrWhiteSpace(title) ? Path.GetFileName(path) : title;
+    }
+
+    private static dynamic? OpenModelVisible(dynamic swApp, string path, out string error)
+    {
+        error = string.Empty;
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            error = "路径为空";
+            return null;
+        }
+
+        path = Path.GetFullPath(path.Trim());
+        if (!File.Exists(path))
+        {
+            error = "文件不存在";
+            return null;
+        }
+
+        var docType = GetDocumentTypeFromPath(path);
+        if (docType == 0)
+        {
+            error = "不支持的 SolidWorks 文件类型";
+            return null;
+        }
+
+        var opened = TryGetOpenModelByPath(swApp, path);
+        if (opened is not null)
+        {
+            return opened;
+        }
+
+        try
+        {
+            try
+            {
+                swApp.DocumentVisible(true, docType);
+            }
+            catch
+            {
+                // Some SW versions or interop paths do not expose DocumentVisible through late binding.
+            }
+
+            int err = 0, warn = 0;
+            dynamic? model;
+            if (TryAsStrongSwApp(swApp, out SldWorks.SldWorks typedApp))
+            {
+                typedApp.DocumentVisible(true, docType);
+                model = typedApp.OpenDoc6(path, docType, 0, "", ref err, ref warn);
+            }
+            else
+            {
+                model = swApp.OpenDoc6(path, docType, 0, "", ref err, ref warn);
+            }
+
+            if (model is null)
+            {
+                error = $"OpenDoc6 返回空，错误码={err}，警告码={warn}";
+                return null;
+            }
+
+            if (err != 0)
+            {
+                error = $"OpenDoc6 错误码={err}，警告码={warn}";
+            }
+
+            return model;
+        }
+        catch (Exception ex)
+        {
+            error = ex.Message;
+            return null;
+        }
+    }
+
+    private static void ActivateOpenedDocument(dynamic swApp, string title, string path)
+    {
+        foreach (var candidate in GetActivationTitleCandidates(title, path))
+        {
+            try
+            {
+                int errors = 0;
+                swApp.ActivateDoc3(candidate, false, 0, ref errors);
+                if (errors == 0)
+                {
+                    return;
+                }
+            }
+            catch
+            {
+                // Try the next title candidate.
+            }
+        }
+    }
+
+    private static IEnumerable<string> GetActivationTitleCandidates(string title, string path)
+    {
+        if (!string.IsNullOrWhiteSpace(title))
+        {
+            yield return title;
+        }
+
+        var fileName = Path.GetFileName(path);
+        if (!string.IsNullOrWhiteSpace(fileName))
+        {
+            yield return fileName;
+        }
+
+        var fileNameWithoutExtension = Path.GetFileNameWithoutExtension(path);
+        if (!string.IsNullOrWhiteSpace(fileNameWithoutExtension))
+        {
+            yield return fileNameWithoutExtension;
+        }
+    }
+
+    internal static void ActivateSolidWorksWindow(dynamic swApp)
+    {
+        var hwnd = GetSolidWorksFrameHwnd(swApp);
+        if (hwnd == IntPtr.Zero)
+        {
+            return;
+        }
+
+        ShowWindow(hwnd, SwRestore);
+        SetForegroundWindow(hwnd);
+        BringWindowToTop(hwnd);
+    }
+
+    private static IntPtr GetSolidWorksFrameHwnd(dynamic swApp)
+    {
+        try
+        {
+            dynamic frame = TryAsStrongSwApp(swApp, out SldWorks.SldWorks typedApp) ? typedApp.Frame() : swApp.Frame();
+            var hwnd = Convert.ToInt64(frame.GetHWnd(), CultureInfo.InvariantCulture);
+            return hwnd == 0 ? IntPtr.Zero : new IntPtr(hwnd);
+        }
+        catch
+        {
+            return IntPtr.Zero;
+        }
+    }
+
     private static dynamic? GetActiveDocSafe(dynamic swApp)
     {
         SldWorks.SldWorks typedApp;
@@ -5784,6 +6892,17 @@ internal static class SolidWorksReader
 
     [DllImport("user32.dll")]
     private static extern int GetWindowThreadProcessId(IntPtr hWnd, out int lpdwProcessId);
+
+    private const int SwRestore = 9;
+
+    [DllImport("user32.dll")]
+    private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+
+    [DllImport("user32.dll")]
+    private static extern bool SetForegroundWindow(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    private static extern bool BringWindowToTop(IntPtr hWnd);
 
     [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
     private static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
