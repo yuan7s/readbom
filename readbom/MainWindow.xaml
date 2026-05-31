@@ -54,10 +54,16 @@
                 <Border Style="{StaticResource ToolbarGroupBorderStyle}">
                     <StackPanel>
                         <TextBlock Style="{StaticResource ToolbarGroupTitleStyle}">连接读取</TextBlock>
-                        <WrapPanel>
-                            <Button Name="ConnectButton" Style="{StaticResource ToolbarWideButtonStyle}" Click="ConnectButton_OnClick">连接 SW</Button>
-                            <Button Name="ReadButton" Style="{StaticResource ToolbarWideButtonStyle}" Click="ReadButton_OnClick">读取属性/BOM</Button>
-                        </WrapPanel>
+                        <DockPanel LastChildFill="False">
+                            <StackPanel DockPanel.Dock="Left" Margin="0,0,8,0">
+                                <Button Name="ConnectButton" Style="{StaticResource ToolbarWideButtonStyle}" Click="ConnectButton_OnClick">连接 SW</Button>
+                                <Button Name="OpenOfflineFileButton" Style="{StaticResource ToolbarWideButtonStyle}" Click="OpenOfflineFileButton_OnClick">打开本地文件</Button>
+                            </StackPanel>
+                            <WrapPanel DockPanel.Dock="Left">
+                                <Button Name="ReadButton" Style="{StaticResource ToolbarWideButtonStyle}" Click="ReadButton_OnClick">读取属性/BOM</Button>
+                                <Button Name="PropertySettingsButton" Style="{StaticResource ToolbarButtonStyle}" Click="PropertySettingsButton_OnClick">属性设置</Button>
+                            </WrapPanel>
+                        </DockPanel>
                     </StackPanel>
                 </Border>
                 <Border Grid.Column="1" Style="{StaticResource ToolbarGroupBorderStyle}">
@@ -76,6 +82,7 @@
                             <Button Name="HeaderFilterButton" Style="{StaticResource ToolbarButtonStyle}" Click="HeaderFilterButton_OnClick">表头筛选</Button>
                             <Button Name="CopyColumnButton" Style="{StaticResource ToolbarButtonStyle}" Click="CopyColumnButton_OnClick">复制列</Button>
                             <Button Name="FillColumnButton" Style="{StaticResource ToolbarButtonStyle}" Click="FillColumnButton_OnClick">填充列</Button>
+                            <Button Name="ExcludeStandardPartsButton" Style="{StaticResource ToolbarWideButtonStyle}" Click="ExcludeStandardPartsButton_OnClick">去除标准件</Button>
                             <Button Name="CalculateBlankSizeButton" Style="{StaticResource ToolbarWideButtonStyle}" Click="CalculateBlankSizeButton_OnClick">计算下料</Button>
                             <Button Name="FindReplaceButton" Style="{StaticResource ToolbarWideButtonStyle}" Click="FindReplaceButton_OnClick">查找替换</Button>
                         </WrapPanel>
@@ -172,7 +179,7 @@
                     <MenuItem Header="打开零件/装配体" Click="OpenModelMenuItem_OnClick"/>
                     <MenuItem Header="打开工程图" Click="OpenDrawingMenuItem_OnClick"/>
                     <Separator/>
-                    <MenuItem Header="保存到 SW" Click="SaveToSwButton_OnClick"/>
+                    <MenuItem Name="SaveContextMenuItem" Header="保存到 SW" Click="SaveToSwButton_OnClick"/>
                 </ContextMenu>
             </DataGrid.ContextMenu>
             <DataGrid.CellStyle>
@@ -260,6 +267,7 @@
                 </DataGridTextColumn>
                 <DataGridTextColumn Header="文件名" Binding="{Binding FileName}" Width="220"/>
                 <DataGridTextColumn Header="配置" Binding="{Binding Configuration}" Width="90"/>
+                <DataGridTextColumn Header="SW-文件夹名称" Binding="{Binding FolderName}" Width="180" IsReadOnly="True"/>
                 <DataGridTextColumn Header="数量" Binding="{Binding Quantity}" Width="56">
                     <DataGridTextColumn.CellStyle>
                         <Style TargetType="DataGridCell" BasedOn="{StaticResource {x:Type DataGridCell}}">
@@ -279,17 +287,6 @@
                         <Style TargetType="DataGridCell" BasedOn="{StaticResource {x:Type DataGridCell}}">
                             <Style.Triggers>
                                 <DataTrigger Binding="{Binding HasUnsetMaterial}" Value="True">
-                                    <Setter Property="Background" Value="#FFFFD6D6"/>
-                                </DataTrigger>
-                            </Style.Triggers>
-                        </Style>
-                    </DataGridTextColumn.CellStyle>
-                </DataGridTextColumn>
-                <DataGridTextColumn Header="完整路径" Binding="{Binding DirectoryPath}" Width="300">
-                    <DataGridTextColumn.CellStyle>
-                        <Style TargetType="DataGridCell" BasedOn="{StaticResource {x:Type DataGridCell}}">
-                            <Style.Triggers>
-                                <DataTrigger Binding="{Binding IsOutsideMainAssemblyDirectory}" Value="True">
                                     <Setter Property="Background" Value="#FFFFD6D6"/>
                                 </DataTrigger>
                             </Style.Triggers>

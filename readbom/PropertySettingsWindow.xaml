@@ -1,0 +1,81 @@
+<Window x:Class="readbom.PropertySettingsWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="属性设置"
+        Width="520"
+        Height="560"
+        MinWidth="420"
+        MinHeight="420"
+        WindowStartupLocation="CenterOwner">
+    <Grid Margin="12">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <TextBlock Foreground="DimGray" Margin="0,0,0,8">
+            内置属性固定用于 BOM 读取，不可编辑。用户属性会作为动态属性列读取、显示和保存。
+        </TextBlock>
+
+        <Grid Grid.Row="1">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="84"/>
+            </Grid.ColumnDefinitions>
+
+            <DataGrid Name="PropertyGrid"
+                      AutoGenerateColumns="False"
+                      CanUserAddRows="True"
+                      CanUserDeleteRows="False"
+                      HeadersVisibility="Column"
+                      GridLinesVisibility="All"
+                      SelectionMode="Extended"
+                      SelectionUnit="FullRow"
+                      CellEditEnding="PropertyGrid_OnCellEditEnding">
+                <DataGrid.Columns>
+                    <DataGridTextColumn Header="属性名"
+                                        Binding="{Binding Name, UpdateSourceTrigger=PropertyChanged}"
+                                        Width="*">
+                        <DataGridTextColumn.CellStyle>
+                            <Style TargetType="DataGridCell" BasedOn="{StaticResource {x:Type DataGridCell}}">
+                                <Style.Triggers>
+                                    <DataTrigger Binding="{Binding IsBuiltIn}" Value="True">
+                                        <Setter Property="IsEnabled" Value="False"/>
+                                        <Setter Property="Background" Value="#FFF0F0F0"/>
+                                    </DataTrigger>
+                                </Style.Triggers>
+                            </Style>
+                        </DataGridTextColumn.CellStyle>
+                    </DataGridTextColumn>
+                    <DataGridTextColumn Header="类型" Binding="{Binding Kind}" Width="90" IsReadOnly="True"/>
+                </DataGrid.Columns>
+            </DataGrid>
+
+            <StackPanel Grid.Column="1"
+                        Margin="8,0,0,0"
+                        VerticalAlignment="Top">
+                <Button Height="32" Margin="0,0,0,8" Click="MoveUpButton_OnClick">上移</Button>
+                <Button Height="32" Click="MoveDownButton_OnClick">下移</Button>
+            </StackPanel>
+        </Grid>
+
+        <TextBlock Grid.Row="2"
+                   Name="ValidationText"
+                   Margin="0,8,0,0"
+                   Foreground="Firebrick"
+                   TextWrapping="Wrap"/>
+
+        <StackPanel Grid.Row="3"
+                    Orientation="Horizontal"
+                    HorizontalAlignment="Right"
+                    Margin="0,12,0,0">
+            <Button Width="88" Height="32" Margin="0,0,8,0" Click="AddButton_OnClick">新增</Button>
+            <Button Width="88" Height="32" Margin="0,0,8,0" Click="DeleteButton_OnClick">删除</Button>
+            <Button Width="88" Height="32" Margin="0,0,8,0" Click="ResetButton_OnClick">恢复默认</Button>
+            <Button Width="88" Height="32" Margin="0,0,8,0" IsDefault="True" Click="SaveButton_OnClick">保存</Button>
+            <Button Width="88" Height="32" IsCancel="True">取消</Button>
+        </StackPanel>
+    </Grid>
+</Window>

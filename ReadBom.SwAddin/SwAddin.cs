@@ -1,14 +1,10 @@
 using System;
-using System.Collections.Generic;
 using System.IO;
-using System.Linq;
-using System.Net;
 using System.Reflection;
 using System.Runtime.InteropServices;
+using System.Windows.Forms;
 using Microsoft.Win32;
-using SolidWorks.Interop.swpublished;
 using SolidWorksTools;
-using SldWorks;
 
 namespace ReadBom.SwAddin;
 
@@ -23,6 +19,7 @@ public sealed class SwAddin : SolidWorks.Interop.swpublished.SwAddin
     private SldWorks.SldWorks _swApp;
     private int _cookie;
     private AddinHttpServer _server;
+    private Control _mainThreadControl;
 
     public bool ConnectToSW(object thisSw, int cookie)
     {
@@ -31,6 +28,12 @@ public sealed class SwAddin : SolidWorks.Interop.swpublished.SwAddin
             AddinLog.Write("ConnectToSW called");
             _swApp = (SldWorks.SldWorks)thisSw;
             _cookie = cookie;
+
+            // Create a hidden WinForms Control on SW's main thread to serve as
+            // the dispatcher for marshaling all COM calls back to this thread.
+            _mainThreadControl = new Control();
+            var _ = _mainThreadControl.Handle; // Force handle creation on this thread
+
             try
             {
                 _swApp.SetAddinCallbackInfo2(0, this, _cookie);
@@ -41,7 +44,7 @@ public sealed class SwAddin : SolidWorks.Interop.swpublished.SwAddin
                 AddinLog.Write("SetAddinCallbackInfo2 ignored: " + ex.Message);
             }
 
-            _server = new AddinHttpServer(_swApp, "http://127.0.0.1:32127/");
+            _server = new AddinHttpServer(_swApp, _mainThreadControl, "http://127.0.0.1:32127/");
             _server.Start();
             AddinLog.Write("HTTP server started");
             return true;

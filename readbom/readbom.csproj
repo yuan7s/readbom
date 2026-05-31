@@ -35,6 +35,11 @@
             <HintPath>..\..\chajian2\lib\Interop.SwConst.dll</HintPath>
             <EmbedInteropTypes>True</EmbedInteropTypes>
         </Reference>
+        <Reference Include="SolidWorks.Interop.swdocumentmgr">
+            <HintPath>..\..\Solution1\Treehouse\bin\Debug\net48\SolidWorks.Interop.swdocumentmgr.dll</HintPath>
+            <EmbedInteropTypes>False</EmbedInteropTypes>
+            <Private>True</Private>
+        </Reference>
     </ItemGroup>
 
 </Project>
